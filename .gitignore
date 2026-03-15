@@ -13,4 +13,5 @@ dist/
 backend/demo.db
 backend/static/images/
 backend/static/videos/
+backend/app/static/images/
 worker/assets/scenes/
