@@ -1,0 +1,16 @@
+# Netlify 部署：仓库根目录放一份，无需在 Netlify 后台再设 Base directory
+# 构建会以 frontend 为根，Next.js 插件会处理路由，避免 Page not found
+
+[build]
+  base = "frontend"
+  command = "npm run build"
+
+[build.environment]
+  NODE_VERSION = "18"
+  NPM_FLAGS = "--legacy-peer-deps"
+
+[[plugins]]
+  package = "@netlify/plugin-nextjs"
+
+# 后端 API：在 Netlify 站点 Environment variables 中设置
+# NEXT_PUBLIC_API_URL = https://你的后端地址

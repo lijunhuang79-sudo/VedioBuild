@@ -1,0 +1,15 @@
+# 当 Netlify 只连接 frontend 目录时使用；若连接仓库根目录，以根目录的 netlify.toml 为准（base = frontend）
+
+[build]
+  command = "npm run build"
+
+[build.environment]
+  NODE_VERSION = "18"
+  NPM_FLAGS = "--legacy-peer-deps"
+
+# 使用 Netlify 官方 Next.js 插件，才能正确渲染 /dashboard、/login 等路由（否则只有 / 不 404）
+[[plugins]]
+  package = "@netlify/plugin-nextjs"
+
+# 后端 API 地址：在 Netlify 站点 Environment variables 里设置 NEXT_PUBLIC_API_URL 为你的后端地址
+# 例如 https://你的后端.railway.app 或 https://api.你的域名.com
