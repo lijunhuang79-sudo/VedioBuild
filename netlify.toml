@@ -1,11 +1,9 @@
 # Netlify 部署：仓库根目录放一份，无需在 Netlify 后台再设 Base directory
 # 构建会以 frontend 为根，Next.js 插件会处理路由，避免 Page not found
-# Publish 为 .next（相对 base = frontend，即 frontend/.next）。Netlify 后台 Publish directory 务必留空，否则会变成 frontend/frontend/.next 报错
 
 [build]
   base = "frontend"
   command = "npm run build"
-  publish = ".next"
 
 [build.environment]
   NODE_VERSION = "18"

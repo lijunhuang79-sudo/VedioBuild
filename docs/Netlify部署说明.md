@@ -31,26 +31,14 @@ git push
 2. **Deploys** → **Trigger deploy** → **Deploy site**（或等自动部署完成）。
 3. 无需改 **Base directory**：根目录的 `netlify.toml` 已写 `base = "frontend"`。
 
-### 3. 登录/注册必须：配置后端地址（否则会“请求失败”）
+### 3. 若要连自己的后端
 
-前端只负责页面，登录、注册、任务等请求需要**已部署的后端 API**。  
-若未配置，首页可以打开，但**登录、注册会一直“请求失败”**。
+在 **Site configuration** → **Environment variables** 里添加：
 
-**步骤：**
+- **Key**：`NEXT_PUBLIC_API_URL`
+- **Value**：你的后端地址，如 `https://你的后端.railway.app` 或 `http://你的服务器IP:8000`
 
-1. **先部署后端**（任选其一）  
-   - [Railway](https://railway.app)、[Render](https://render.com)、[Fly.io](https://fly.io) 等部署本项目的 `backend`（Python/FastAPI）。  
-   - 或在自己服务器上运行 `scripts/start-backend.sh`，保证有公网可访问的 URL（如 `https://你的后端.railway.app`）。
-
-2. **在 Netlify 配置环境变量**  
-   - 打开 Netlify 站点 → **Site configuration** → **Environment variables** → **Add a variable**。  
-   - **Key**：`NEXT_PUBLIC_API_URL`  
-   - **Value**：上一步的后端地址，例如 `https://你的后端.railway.app`（不要末尾斜杠）。
-
-3. **重新部署**  
-   - **Deploys** → **Trigger deploy** → **Deploy site**（环境变量修改后必须重新部署才会生效）。
-
-配置正确后，登录、注册应能正常请求后端。
+保存后再次 **Trigger deploy**。
 
 ## 确认成功
 
