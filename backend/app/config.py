@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     # 应用
     api_base_url: str = "http://localhost:8000"
     frontend_url: str = "http://localhost:3000"
-    cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000,http://localhost:3001,http://127.0.0.1:3001"
+    cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000,http://localhost:3001,http://127.0.0.1:3001,http://192.168.2.190:3000"
 
     # 本地试用：不连 Redis 时在进程内执行任务，并用本地目录存视频
     inline_worker: bool = False  # 设置 INLINE_WORKER=1 启用

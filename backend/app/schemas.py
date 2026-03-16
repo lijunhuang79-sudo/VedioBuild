@@ -47,6 +47,12 @@ class TaskResponse(BaseModel):
     video_url: Optional[str]
     error_message: Optional[str] = None
     created_at: datetime
+    # 生成历史：用于「再用一次」回填
+    script_text: Optional[str] = None
+    scene_descriptions: Optional[list[str]] = None
+    voice: Optional[str] = None
+    style: Optional[str] = None
+    bgm: Optional[str] = None
 
     class Config:
         from_attributes = True

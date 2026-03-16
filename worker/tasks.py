@@ -74,6 +74,12 @@ DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
 WANXIANG_VIDEO_ENABLED = os.getenv("USE_WANXIANG_VIDEO", "").strip().lower() in ("1", "true", "yes")
 WANXIANG_VIDEO_BASE = (os.getenv("DASHSCOPE_BASE_URL") or "https://dashscope.aliyuncs.com").rstrip("/")
 
+# FFmpeg 合成视频超时（秒）；长文案/六镜+高码率编码可能较慢，默认 10 分钟，可通过 FFMPEG_TIMEOUT_SEC 调大
+FFMPEG_TIMEOUT_SEC = max(120, int(os.getenv("FFMPEG_TIMEOUT_SEC", "600")))
+
+# 每个镜头叠加的固定文字（如姓名班级），可空字符串关闭
+STUDENT_LINE = os.getenv("VIDEO_STUDENT_LINE", "王弘毅二年级（2班）").strip()
+
 celery_app = Celery(
     "ai_video_factory",
     broker=REDIS_URL,
@@ -99,6 +105,11 @@ def generate_video_task(
     voice: Optional[str] = None,
     style: Optional[str] = None,
     bgm: Optional[str] = None,
+    script_text: Optional[str] = None,
+    scene_descriptions: Optional[list] = None,
+    reuse_scene_urls: Optional[list] = None,
+    custom_scene_image_paths: Optional[list] = None,
+    regenerate_scene_index_with_jimeng: Optional[int] = None,
 ):
     """
     生成视频任务
@@ -131,6 +142,7 @@ def generate_video_task(
 
         logger.info("Worker 使用故事化广告 Skill 生成视频（故事文案 → 抓取对应背景图 → 嵌入每镜）...")
         output_path = None
+        scene_urls = None
         if WANXIANG_VIDEO_ENABLED and DASHSCOPE_API_KEY:
             story = _generate_story_script_with_deepseek(theme=theme, style=style)
             script_text = story.get("script") or theme[:200]
@@ -138,21 +150,33 @@ def generate_video_task(
         if not output_path:
             try:
                 from worker.story_ad_skill import run_story_ad_skill
-                output_path = run_story_ad_skill(
+                output_path, scene_urls = run_story_ad_skill(
                     theme=theme,
                     image_path=image_path,
                     image_url=image_url,
                     voice=voice,
                     style=style,
                     bgm=bgm,
+                    script_text=script_text.strip() if script_text else None,
+                    scene_descriptions=scene_descriptions if (scene_descriptions and len(scene_descriptions) == 6) else None,
+                    task_id=task_id,
+                    reuse_scene_urls=reuse_scene_urls if (reuse_scene_urls and len(reuse_scene_urls) == 6) else None,
+                    custom_scene_image_paths=custom_scene_image_paths if (custom_scene_image_paths and len(custom_scene_image_paths) == 6) else None,
+                    regenerate_scene_index_with_jimeng=regenerate_scene_index_with_jimeng,
                 )
             except ImportError:
                 story = _generate_story_script_with_deepseek(theme=theme, style=style)
-                script_text = story.get("script") or _generate_script_with_deepseek(theme=theme, image_url=image_url, style=style)
-                scene_descriptions = story.get("scenes") if isinstance(story.get("scenes"), list) and len(story.get("scenes", [])) >= 6 else None
-                output_path = _generate_video_mvp(
-                    theme=theme, script_text=script_text, image_url=image_url, image_path=image_path,
-                    voice=voice, style=style, bgm=bgm, scene_descriptions=scene_descriptions,
+                fallback_script = story.get("script") or _generate_script_with_deepseek(theme=theme, image_url=image_url, style=style)
+                fallback_scenes = story.get("scenes") if isinstance(story.get("scenes"), list) and len(story.get("scenes", [])) >= 6 else None
+                output_path, _ = _generate_video_mvp(
+                    theme=theme,
+                    script_text=script_text.strip() if script_text else fallback_script,
+                    image_url=image_url,
+                    image_path=image_path,
+                    voice=voice,
+                    style=style,
+                    bgm=bgm,
+                    scene_descriptions=scene_descriptions if (scene_descriptions and len(scene_descriptions) == 6) else fallback_scenes,
                 )
 
         logger.info("Worker 上传视频...")
@@ -162,18 +186,27 @@ def generate_video_task(
         if output_path and os.path.exists(output_path):
             os.remove(output_path)
 
-        # 更新任务完成
+        # 更新任务完成（含 scene_urls 供「再用一次」复用）
+        scene_urls_json = None
+        try:
+            if scene_urls and len(scene_urls) == 6:
+                import json
+                scene_urls_json = json.dumps(scene_urls, ensure_ascii=False)
+        except Exception:
+            scene_urls_json = None
         db.execute(
             text("""
                 UPDATE video_tasks 
                 SET status = 'completed', 
                     video_url = :video_url,
+                    scene_urls = :scene_urls,
                     completed_at = :completed_at
                 WHERE task_id = :task_id
             """),
             {
                 "task_id": task_id,
                 "video_url": video_url,
+                "scene_urls": scene_urls_json,
                 "completed_at": datetime.utcnow(),
             },
         )
@@ -329,7 +362,8 @@ def _synthesize_speech_aliyun(text: str, voice: Optional[str] = None) -> Optiona
     token = _get_aliyun_nls_token()
     if not token:
         return None
-    text = (text or "").strip()[:300]
+    # 单次请求字数上限（阿里云流式 TTS 建议不宜过长，600 内较稳）
+    text = (text or "").strip()[:600]
     if not text:
         return None
     # 默认若兮；要更有感情可设 ALIYUN_TTS_VOICE=zhimi_emo 或 zhiyan_emo（多情感需控制台开通）
@@ -395,6 +429,20 @@ def _synthesize_speech_aliyun(text: str, voice: Optional[str] = None) -> Optiona
     except Exception as e:
         logger.warning("阿里云 TTS 合成失败: %s", e)
         return None
+
+
+def _synthesize_speech_aliyun_with_fallback(text: str, voice: Optional[str] = None) -> Optional[str]:
+    """先使用指定 voice 合成，失败时用备用音色 ruoxi 重试一次，保证有声音。"""
+    out = _synthesize_speech_aliyun(text, voice=voice)
+    if out and os.path.exists(out):
+        return out
+    fallback = (os.getenv("ALIYUN_TTS_FALLBACK_VOICE") or "ruoxi").strip() or "ruoxi"
+    if voice and voice != fallback:
+        logger.info("TTS 使用备用音色重试: %s -> %s", voice, fallback)
+        out = _synthesize_speech_aliyun(text, voice=fallback)
+        if out and os.path.exists(out):
+            return out
+    return None
 
 
 def _heic_to_png_with_sips(heic_path: str, png_path: str) -> bool:
@@ -582,6 +630,102 @@ def _wrap_subtitle_lines(raw: str, max_chars_per_line: int, max_lines: int = 4) 
     return lines[:max_lines]
 
 
+def _wrap_subtitle_lines_unlimited(raw: str, max_chars_per_line: int = 22) -> list:
+    """将字幕文案按每行字数换行，不限制行数，用于滚动字幕完整显示。"""
+    if not raw or max_chars_per_line < 1:
+        return [raw] if raw else []
+    lines = []
+    rest = raw
+    while rest:
+        rest = rest.strip()
+        if not rest:
+            break
+        if len(rest) <= max_chars_per_line:
+            lines.append(rest)
+            break
+        chunk = rest[: max_chars_per_line + 1]
+        break_at = -1
+        for i, c in enumerate(reversed(chunk)):
+            if c in "。！？，,、；： ":
+                break_at = len(chunk) - i
+                break
+        if break_at <= 0:
+            break_at = max_chars_per_line
+        lines.append(rest[:break_at].strip())
+        rest = rest[break_at:]
+    return lines
+
+
+def _render_student_line_png(text: str, png_path: str, font_size: int = 42) -> bool:
+    """生成单行固定文字（如姓名班级）的小 PNG，透明底、白字描边，用于 overlay，避免 drawtext 字体兼容问题。"""
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        return False
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    font_path = _pick_font_path()
+    font = _load_font(font_path, font_size)
+    img = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    bbox = draw.textbbox((0, 0), raw, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    pad_x, pad_y = 16, 8
+    w, h = tw + pad_x * 2, th + pad_y * 2
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    x0, y0 = pad_x, pad_y
+    for dx, dy in [(-1, -1), (-1, 1), (1, -1), (1, 1), (0, -1), (0, 1), (-1, 0), (1, 0)]:
+        draw.text((x0 + dx, y0 + dy), raw, fill=(0, 0, 0, 220), font=font)
+    draw.text((x0, y0), raw, fill=(255, 255, 255, 255), font=font)
+    img.save(png_path, "PNG")
+    return True
+
+
+def _render_segment_text_to_tall_png(
+    segment_text: str,
+    png_path: str,
+    width: int,
+    style: Optional[str] = None,
+    line_height: int = 48,
+    max_chars_per_line: int = 22,
+) -> Optional[int]:
+    """
+    将一段旁白全文绘制到一张「高图」上（不限制行数），用于滚动字幕。
+    返回图片高度（像素），失败返回 None。背景透明，文字自下而上排列便于 overlay 从下往上滚动。
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return None
+    raw = (segment_text or " ").replace("\n", " ").strip()
+    if not raw:
+        raw = " "
+    font_path = _pick_font_path()
+    main_font = _load_font(font_path, 42)
+    lines = _wrap_subtitle_lines_unlimited(raw, max_chars_per_line=max_chars_per_line)
+    pad_top, pad_bottom = 24, 24
+    total_h = len(lines) * line_height + pad_top + pad_bottom
+    if total_h < 200:
+        total_h = 200
+    img = Image.new("RGBA", (width, total_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    y0 = pad_top
+    for line in lines:
+        if not line:
+            continue
+        bbox = draw.textbbox((0, 0), line, font=main_font)
+        tw = bbox[2] - bbox[0]
+        main_x = max(20, (width - tw) // 2)
+        for dx, dy in [(-2, -2), (-2, 2), (2, -2), (2, 2)]:
+            draw.text((main_x + dx, y0 + dy), line, fill=(0, 0, 0, 200), font=main_font)
+        draw.text((main_x, y0), line, fill=(255, 255, 255, 255), font=main_font)
+        y0 += line_height
+    img.save(png_path, "PNG")
+    return total_h
+
+
 def _render_text_to_png(
     text: str, png_path: str, width: int = 1280, height: int = 720, style: Optional[str] = None
 ) -> bool:
@@ -719,8 +863,8 @@ def _render_theme_poster(theme: str, script_text: str, png_path: str, width: int
 
         title = (theme or "AI 视频工厂").strip()[:16]
         subtitle = (script_text or theme or "AI 视频工厂").replace("\n", " ").strip()[:48]
-        tag = "史诗 · 电影级" if is_blockbuster else ("科技 · 未来" if is_tech else "🔥 爆款推荐")
-        cta = "立即生成 · 抢占流量"
+        tag = "史诗 · 电影级" if is_blockbuster else ("科技 · 未来" if is_tech else "精选")
+        cta = "立即生成"
 
         # 主卡片：深色玻璃感 + 细边（科技感青蓝，好莱坞大片金/琥珀，否则金边）
         card_x0, card_y0 = 72, 100
@@ -1084,6 +1228,32 @@ _SCENE_LIBRARY_URLS = [
 ]
 
 
+# 自定义旁白时，即梦不可用则按场景描述关键词从图库选图（关键词 -> _SCENE_LIBRARY_URLS 下标）
+# 顺序影响匹配优先级，先匹配到的优先；图库见 _SCENE_LIBRARY_URLS 注释（0 咖啡 2 客厅 5 书 6 店铺 8 街道 16 森林）
+_SCENE_DESC_KEYWORDS_TO_LIB_INDEX = [
+    (("分针", "大钟", "数字", "分钟", "钟表特写"), 2),                       # 客厅/室内，钟表镜头
+    (("时钟", "钟表", "钟楼", "小镇", "街道", "快递", "镇口", "童话"), 8),   # 都市街道
+    (("糖果", "盒子", "分装", "桌面", "有余数", "除法", "颗"), 0),           # 咖啡/桌面
+    (("森林", "小路", "奔跑", "建筑"), 16),                                  # 森林
+    (("邮局", "室内", "阿姨", "奶糖", "水果糖", "软糖", "1085"), 6),        # 店铺/室内
+    (("教室", "书房", "数学", "书", "总结", "算式", "身边"), 5),             # 阅读/书
+]
+
+
+def _get_scene_url_by_description(description: Optional[str], scene_index: int) -> Optional[str]:
+    """根据场景描述关键词从图库选一张最相关的 URL；即梦不可用时用于自定义旁白。"""
+    if not description or not (d := description.strip()):
+        return None
+    d = d[:120]
+    for keywords, lib_index in _SCENE_DESC_KEYWORDS_TO_LIB_INDEX:
+        if any(kw in d for kw in keywords):
+            if 0 <= lib_index < len(_SCENE_LIBRARY_URLS):
+                return _SCENE_LIBRARY_URLS[lib_index]
+    # 无匹配时按镜索引轮换图库，使六镜至少有不同画面
+    idx = scene_index % len(_SCENE_LIBRARY_URLS)
+    return _SCENE_LIBRARY_URLS[idx]
+
+
 def _get_scene_urls_for_style(style: Optional[str], theme: Optional[str] = None) -> list:
     """根据风格与主题返回 6 个场景图 URL，主题不同时切换 A/B 组以更好衬托主题。"""
     s = (style or "").strip().lower()
@@ -1111,12 +1281,12 @@ def _build_jimeng_prompt_for_scene(
     else:
         style_hint = "cinematic commercial, soft focus background, 16:9"
     if scene_description and (scene_description := scene_description.strip())[:1]:
-        # 故事情节描述：即梦支持中英文，保留关键画面信息，便于与故事契合
-        desc = scene_description[:150].replace("\n", " ").strip()
-        # 中英结合提升即梦理解：场景描述 + 风格 + 无文字无人物（适合做背景）
+        # 自定义旁白/故事情节：画面必须严格体现该场景，优先使用用户描述
+        desc = scene_description[:200].replace("\n", " ").strip()
         return (
-            f"广告背景图，场景：{desc}，主题：{theme_part}。"
-            f"风格：{style_hint}。高质量、虚化背景、无文字、无人脸，适合作为产品展示背景。"
+            f"画面必须严格体现以下场景，不要偏离：{desc}。"
+            f"风格：{style_hint}。主题：{theme_part}。"
+            f"高质量虚化背景、无文字、无人脸特写，适合作为视频背景。"
         )
     # 无故事情节时用默认 6 镜模板
     labels = [
@@ -1300,10 +1470,12 @@ def _get_scene_background_image(
     style: Optional[str] = None,
     theme: Optional[str] = None,
     scene_description: Optional[str] = None,
+    apply_blur: bool = True,
 ) -> Optional["Image.Image"]:
     """
     获取第 index 个场景的背景图：优先读本地缓存；
     首选即梦文生图（与故事情节一致），未配置或失败时用 URL 图库备用，最后回退手绘。
+    apply_blur=False 时不虚化（用于自定义旁白模式）。
     """
     from PIL import Image
     i = index % 6
@@ -1322,12 +1494,14 @@ def _get_scene_background_image(
             logger.debug("第 %d 镜背景：优先即梦文生图（与故事情节一致）", i)
             prompt = _build_jimeng_prompt_for_scene(i, style, theme, scene_description=scene_description)
             got = _generate_scene_image_jimeng(prompt, width, height, str(path))
-        # 第二选项：URL 图库下载（风格/主题对应 6 张图）
+        # 第二选项：URL 图库下载（风格/主题对应 6 张图）；有场景描述时优先按描述关键词选图
         if not got:
             if PREFER_JIMENG_SCENE and JIYMENG_ENABLED:
                 logger.info("即梦未生成第 %d 镜背景，使用 URL 图库备用", i)
             urls = _get_scene_urls_for_style(style, theme=theme)
-            url = os.getenv(f"SCENE_IMAGE_URL_{i}", urls[i] if i < len(urls) else _SCENE_IMAGE_URLS_DEFAULT[i])
+            url = _get_scene_url_by_description(scene_description, i) if scene_description else None
+            if not url:
+                url = os.getenv(f"SCENE_IMAGE_URL_{i}", urls[i] if i < len(urls) else _SCENE_IMAGE_URLS_DEFAULT[i])
             if not _download_scene_image(url, str(path), scene_index=i):
                 # 按镜索引选用不同 fallback，避免 6 张图都用同一张；再轮询其余 URL
                 fallback_list = _SCENE_IMAGE_URLS_FALLBACK
@@ -1349,8 +1523,8 @@ def _get_scene_background_image(
         img = Image.open(str(path)).convert("RGB")
         img = img.resize((width, height), Image.Resampling.LANCZOS)
         img = _apply_style_color_grade(img, style)
-        # 背景虚化，不抢主题，突出前景主体
-        img = img.filter(ImageFilter.GaussianBlur(radius=SCENE_BLUR_RADIUS))
+        if apply_blur:
+            img = img.filter(ImageFilter.GaussianBlur(radius=SCENE_BLUR_RADIUS))
         return img
     except Exception as e:
         logger.warning("加载场景图 scene_%s 失败: %s", i, e)
@@ -1358,15 +1532,16 @@ def _get_scene_background_image(
 
 
 def _load_and_style_background_image(
-    image_path: str, width: int, height: int, style: Optional[str] = None
+    image_path: str, width: int, height: int, style: Optional[str] = None, apply_blur: bool = True
 ) -> Optional["Image.Image"]:
-    """从本地路径加载图片，做风格调色与虚化，与 _get_scene_background_image 输出一致。"""
+    """从本地路径加载图片，做风格调色；apply_blur=False 时不虚化（自定义旁白模式）。"""
     try:
         from PIL import Image, ImageFilter
         img = Image.open(image_path).convert("RGB")
         img = img.resize((width, height), Image.Resampling.LANCZOS)
         img = _apply_style_color_grade(img, style)
-        img = img.filter(ImageFilter.GaussianBlur(radius=SCENE_BLUR_RADIUS))
+        if apply_blur:
+            img = img.filter(ImageFilter.GaussianBlur(radius=SCENE_BLUR_RADIUS))
         return img
     except Exception as e:
         logger.warning("加载背景图失败 %s: %s", image_path, e)
@@ -1380,23 +1555,27 @@ def _fetch_and_save_story_backgrounds(
     width: int,
     height: int,
     save_dir: str,
+    no_blur: bool = False,
 ) -> list:
     """
     按故事情节描述抓取并保存 6 张对应场景背景图到 save_dir（scene_0_bg.jpg ... scene_5_bg.jpg）。
-    首选即梦文生图（与故事一致），失败则用 URL 图库备用。返回 6 个文件路径，任一张失败则返回空列表。
+    首选即梦文生图（与故事一致），失败则用 URL 图库备用。
+    no_blur=True 时不虚化（自定义旁白模式）。
     """
     if not scene_descriptions or len(scene_descriptions) < 6:
         return []
     if PREFER_JIMENG_SCENE and JIYMENG_ENABLED:
-        logger.info("6 镜背景：首选即梦文生图（与故事情节一致），失败则 URL 备用")
+        logger.info("6 镜背景：按配置走即梦文生图（与故事情节一致），失败则按描述关键词选图库备用")
     else:
-        logger.info("6 镜背景：使用 URL 图库（即梦未配置或已关闭）")
+        logger.info("6 镜背景：即梦未配置或已关闭，按场景描述关键词选图库")
+    if no_blur:
+        logger.info("自定义旁白模式：背景图不虚化")
     os.makedirs(save_dir, exist_ok=True)
     paths = []
     for i in range(6):
         desc = (scene_descriptions[i] if i < len(scene_descriptions) else "").strip() or None
         img = _get_scene_background_image(
-            i, width, height, style=style, theme=theme, scene_description=desc
+            i, width, height, style=style, theme=theme, scene_description=desc, apply_blur=not no_blur
         )
         if img is None:
             logger.warning("故事情节背景图第 %d 镜获取失败，回退将使用默认流程", i)
@@ -1616,11 +1795,13 @@ def _generate_six_scenes(
     theme: Optional[str] = None,
     scene_descriptions: Optional[list] = None,
     scene_background_paths: Optional[list] = None,
+    apply_blur: bool = True,
 ) -> list:
     """
     抠图后把主体合成到 6 种创意背景上。
     若提供 scene_background_paths（6 张已保存的故事情节背景图路径），则直接加载这 6 张作为每镜背景；
     否则若提供 scene_descriptions 则按描述生成/取图；再否则按风格+主题选用场景图。抠图失败则回退为「原图+6 种华丽底」。
+    apply_blur=False 时加载的背景图不虚化（自定义旁白模式）。
     """
     try:
         from PIL import Image, ImageDraw
@@ -1647,12 +1828,17 @@ def _generate_six_scenes(
             pass
         subject_rgba = _remove_background(product, session=rembg_session)
 
-        # 竖图/正方：上轻下重视为倒立（头在上应为轻的一侧），旋转 180° 纠正
+        # 竖图/正方：仅当「上轻下重」非常明显时才旋转 180°，避免罐装/筒状商品（柠檬茶筒等）被误判为倒立
+        # 阈值 0.55：top_sum < bottom_sum*0.55 才视为倒立；柱状物上下质量接近或略上轻下重时不旋转
         if subject_rgba is not None:
             halves = _subject_alpha_halves(subject_rgba)
-            if halves and halves["top_sum"] < halves["bottom_sum"]:
-                product = product.rotate(180, expand=False)
-                subject_rgba = subject_rgba.rotate(180, expand=False)
+            if halves:
+                top_sum = halves["top_sum"]
+                bottom_sum = halves["bottom_sum"]
+                if bottom_sum > 0 and top_sum < bottom_sum * 0.55:
+                    product = product.rotate(180, expand=False)
+                    subject_rgba = subject_rgba.rotate(180, expand=False)
+                    logger.info("竖图倒立纠正: top_sum/bottom_sum=%.2f，已旋转180°", top_sum / bottom_sum)
 
         use_cutout = subject_rgba is not None
         if use_cutout:
@@ -1662,7 +1848,7 @@ def _generate_six_scenes(
 
         for i in range(6):
             if scene_background_paths and len(scene_background_paths) >= 6 and os.path.isfile(scene_background_paths[i]):
-                bg = _load_and_style_background_image(scene_background_paths[i], width, height, style=style)
+                bg = _load_and_style_background_image(scene_background_paths[i], width, height, style=style, apply_blur=apply_blur)
                 if bg is None:
                     desc = (scene_descriptions[i] if scene_descriptions and i < len(scene_descriptions) else None) or None
                     bg = _draw_creative_background(i, width, height, style=style, theme=theme, scene_description=desc)
@@ -1793,15 +1979,15 @@ def _tts_one_segment_with_comma_pause(seg_text: str, voice: Optional[str], run_f
     if not parts:
         return None, _COMMA_PAUSE_SEC
     if len(parts) == 1:
-        path = _synthesize_speech_aliyun(parts[0], voice=voice)
+        path = _synthesize_speech_aliyun_with_fallback(parts[0], voice=voice)
         if path and os.path.exists(path):
             return path, max(0.5, _get_audio_duration_sec(path))
         return None, 0
-    # 多句：每句 TTS，中间插 1 秒静音后拼接
+    # 多句：每句 TTS，中间插 1 秒静音后拼接（单句失败时用备用音色重试）
     wav_paths = []
     durations = []
     for p in parts:
-        path = _synthesize_speech_aliyun(p, voice=voice)
+        path = _synthesize_speech_aliyun_with_fallback(p, voice=voice)
         if not path or not os.path.exists(path):
             for fp in wav_paths:
                 try:
@@ -2057,6 +2243,29 @@ def _generate_video_wanxiang(theme: str, script_text: str, style: Optional[str] 
         return None
 
 
+def _persist_scene_urls(task_id: str, scene_paths: list) -> None:
+    """将 6 张场景图复制到 backend/static/scenes/<task_id>/ 供「再用一次」复用。"""
+    if not task_id or len(scene_paths) != 6:
+        return
+    static_root = os.path.dirname(os.path.abspath(os.getenv("LOCAL_VIDEO_DIR", "./static/videos")))
+    dest_dir = os.path.join(static_root, "scenes", task_id)
+    try:
+        import shutil
+        os.makedirs(dest_dir, exist_ok=True)
+        for i, src in enumerate(scene_paths):
+            if os.path.isfile(src):
+                shutil.copy2(src, os.path.join(dest_dir, f"{i}.png"))
+        logger.info("已持久化 6 张场景图到 %s", dest_dir)
+    except Exception as e:
+        logger.warning("持久化场景图失败: %s", e)
+
+
+def _get_scene_urls_for_task(task_id: str) -> list:
+    """返回某任务持久化后的 6 张场景图 URL 列表。"""
+    base = (os.getenv("API_BASE_URL") or "http://localhost:8000").rstrip("/")
+    return [f"{base}/static/scenes/{task_id}/{i}.png" for i in range(6)]
+
+
 def _generate_video_mvp(
     theme: str,
     script_text: str,
@@ -2066,17 +2275,28 @@ def _generate_video_mvp(
     style: Optional[str] = None,
     bgm: Optional[str] = None,
     scene_descriptions: Optional[list] = None,
-) -> str:
+    task_id: Optional[str] = None,
+    reuse_scene_urls: Optional[list] = None,
+    custom_scene_image_paths: Optional[list] = None,
+    regenerate_scene_index_with_jimeng: Optional[int] = None,
+) -> tuple:
     """
     MVP: 背景图 + 字幕 + TTS 配音；视频时长 = 配音时长，声画同步。
     若提供 scene_descriptions（6 个故事情节对应的场景描述），则每镜背景图按该描述生成/选取，故事与画面一致。
-    全面优化为广告大片级：1080p、电影感镜头与转场、强暗角、高码率。
+    若提供 reuse_scene_urls（6 个场景图 URL），则直接从本地库加载，不再生成新图（用于「再用一次」）。
+    若提供 custom_scene_image_paths（6 个元素，可为 None 或路径），则对应下标使用该图替换当镜背景，实现「单独更换第 N 镜」。
+    若提供 regenerate_scene_index_with_jimeng（0~5），则仅用即梦 AI 重绘该镜背景，其余镜不变（常用于「再用一次」时只重绘第 2 镜等）。
+    返回 (out_path, scene_urls)；scene_urls 为 6 张图 URL 列表或 None。
     """
     import subprocess
 
     w, h = VIDEO_WIDTH, VIDEO_HEIGHT
-    # 按段 TTS 使用完整文案（最多 400 字），单条字幕/回退用前 80 字
-    script_for_tts = (script_text or theme)[:800].replace("\n", " ").strip() or "AI 视频工厂"
+    persisted_scene_urls = None
+    reused_scene_paths = False
+    # 自定义旁白模式（有 script_text）时保留全文，最多 2500 字；主题模式用 800
+    _script_raw = (script_text or theme or "").replace("\n", " ").strip()
+    _cap = 2500 if (script_text and script_text.strip()) else 800
+    script_for_tts = (_script_raw[:_cap] if _script_raw else theme or "AI 视频工厂").strip() or "AI 视频工厂"
     display_text = script_for_tts[:120]
     out_path = f"/tmp/ai_video_{uuid.uuid4()}.mp4"
     text_png = f"/tmp/ai_video_txt_{uuid.uuid4()}.png"
@@ -2085,7 +2305,7 @@ def _generate_video_mvp(
     text_png_segments = []  # 按段字幕图，仅 6 场景+按段 TTS 时使用
 
     def run_ffmpeg(args: list) -> subprocess.CompletedProcess:
-        return subprocess.run(args, capture_output=True, timeout=120, check=False)
+        return subprocess.run(args, capture_output=True, timeout=FFMPEG_TIMEOUT_SEC, check=False)
 
     try:
         if not _render_text_to_png(display_text, text_png, width=w, height=h, style=style):
@@ -2099,20 +2319,46 @@ def _generate_video_mvp(
             has_bg = _render_theme_poster(theme, display_text, bg_png, width=w, height=h, style=style)
         logger.info("视频背景: has_bg=%s image_path=%s image_url=%s", has_bg, image_path or "(无)", "有" if image_url else "无")
 
-        # 先生成 6 场景图：有故事情节描述时先抓取并保存 6 张对应背景图，再合成每镜（故事与画面一致）
+        # 先生成 6 场景图：可复用本地库（再用一次）；否则按故事情节描述抓取/生成
         scene_dir = None
         scene_paths = []
-        if has_bg and os.path.exists(bg_png):
+        has_user_image = bool(image_path or image_url)
+        if reuse_scene_urls and len(reuse_scene_urls) == 6:
+            # 再用一次：从本地 static/scenes/<id>/ 加载已有场景图
+            static_root = os.path.dirname(os.path.abspath(os.getenv("LOCAL_VIDEO_DIR", "./static/videos")))
+            for i, url in enumerate(reuse_scene_urls):
+                if not url or not isinstance(url, str):
+                    break
+                path_part = url.split("/static/")[-1].lstrip("/") if "/static/" in url else url.lstrip("/")
+                local_path = os.path.join(static_root, path_part)
+                if os.path.isfile(local_path):
+                    scene_paths.append(local_path)
+            if len(scene_paths) == 6:
+                reused_scene_paths = True
+                logger.info("已从本地库复用 6 张场景图: %s", reuse_scene_urls[0][:60] + "...")
+        if not reused_scene_paths and has_bg and os.path.exists(bg_png):
             scene_dir = f"/tmp/ai_video_scenes_{uuid.uuid4()}"
+            os.makedirs(scene_dir, exist_ok=True)
             scene_bg_paths = []
             if scene_descriptions and len(scene_descriptions) >= 6:
                 scene_bg_paths = _fetch_and_save_story_backgrounds(
-                    scene_descriptions, style, theme, w, h, scene_dir
+                    scene_descriptions, style, theme, w, h, scene_dir, no_blur=True
                 )
-            if len(scene_bg_paths) == 6:
+            if len(scene_bg_paths) == 6 and not has_user_image:
+                # 无用户上传图：六镜直接用背景图，不虚化（自定义旁白模式）
+                for i in range(6):
+                    bg = _load_and_style_background_image(scene_bg_paths[i], w, h, style=style, apply_blur=False)
+                    if bg is not None:
+                        p = os.path.join(scene_dir, f"scene_{i}.png")
+                        bg.save(p, "PNG")
+                        scene_paths.append(p)
+                if len(scene_paths) == 6:
+                    logger.info("已生成 6 镜纯背景图（无产品贴图）: %s", scene_dir)
+            elif len(scene_bg_paths) == 6:
                 scene_paths = _generate_six_scenes(
                     bg_png, scene_dir, w, h, style=style, theme=theme,
                     scene_descriptions=None, scene_background_paths=scene_bg_paths,
+                    apply_blur=False,
                 )
             else:
                 scene_paths = _generate_six_scenes(
@@ -2123,6 +2369,37 @@ def _generate_video_mvp(
         NUM_SCENES = 6
         XFADE_DUR = BLOCKBUSTER_XFADE_DUR if is_blockbuster else 0.8
         use_six_scenes = len(scene_paths) >= NUM_SCENES
+        # 自定义旁白模式：可单独替换某镜背景图（custom_scene_image_paths[i] 为路径则替换第 i 镜）
+        if use_six_scenes and custom_scene_image_paths and len(custom_scene_image_paths) >= NUM_SCENES:
+            for i in range(NUM_SCENES):
+                cp = custom_scene_image_paths[i] if i < len(custom_scene_image_paths) else None
+                if cp and isinstance(cp, str) and os.path.isfile(cp):
+                    scene_paths[i] = cp
+                    logger.info("第 %d 镜使用自定义背景图: %s", i + 1, cp[:60] + "..." if len(cp) > 60 else cp)
+        # 仅用即梦重绘第 N 镜（0-based）：仅在「再用一次」复用 6 张后生效，其余 5 镜不变
+        if (
+            use_six_scenes
+            and reused_scene_paths
+            and regenerate_scene_index_with_jimeng is not None
+            and 0 <= regenerate_scene_index_with_jimeng < NUM_SCENES
+            and len(scene_paths) >= NUM_SCENES
+        ):
+            idx = int(regenerate_scene_index_with_jimeng)
+            scene_desc = (scene_descriptions[idx] if scene_descriptions and len(scene_descriptions) > idx else None) or None
+            prompt = _build_jimeng_prompt_for_scene(idx, style, theme, scene_description=scene_desc)
+            tmp_jimeng = f"/tmp/ai_video_jimeng_scene_{idx}_{uuid.uuid4()}.png"
+            if _generate_scene_image_jimeng(prompt, w, h, tmp_jimeng):
+                scene_paths[idx] = tmp_jimeng
+                logger.info("已用即梦重绘第 %d 镜背景图", idx + 1)
+            else:
+                logger.warning("即梦重绘第 %d 镜失败，保留原图", idx + 1)
+        elif regenerate_scene_index_with_jimeng is not None and not reused_scene_paths:
+            logger.info("仅重绘第 %d 镜需配合「再用一次」使用（复用 6 张场景图），当前未复用已忽略", regenerate_scene_index_with_jimeng + 1)
+        if task_id and use_six_scenes and (not reused_scene_paths or regenerate_scene_index_with_jimeng is not None):
+            _persist_scene_urls(task_id, scene_paths)
+            persisted_scene_urls = _get_scene_urls_for_task(task_id)
+        if reused_scene_paths and reuse_scene_urls and len(reuse_scene_urls) == 6 and regenerate_scene_index_with_jimeng is None:
+            persisted_scene_urls = list(reuse_scene_urls)
 
         # 真人配音：6 场景时优先按段 TTS，使每段解说与对应场景时间点一致；保留 segment_texts 供按段字幕使用
         segment_durations = None
@@ -2130,6 +2407,11 @@ def _generate_video_mvp(
         if use_six_scenes and ALIYUN_NLS_APPKEY and (script_for_tts or "").strip():
             segment_texts = _split_script_to_segments(script_for_tts, NUM_SCENES)
             tts_path, segment_durations = _generate_tts_per_segment_and_concat(segment_texts, voice, run_ffmpeg)
+            if not tts_path or not segment_durations or len(segment_durations) != NUM_SCENES:
+                fallback_voice = (os.getenv("ALIYUN_TTS_FALLBACK_VOICE") or "ruoxi").strip() or "ruoxi"
+                if voice != fallback_voice:
+                    logger.info("按段 TTS 失败，使用备用音色重试: %s -> %s", voice, fallback_voice)
+                    tts_path, segment_durations = _generate_tts_per_segment_and_concat(segment_texts, fallback_voice, run_ffmpeg)
             if tts_path and segment_durations and len(segment_durations) == NUM_SCENES:
                 duration_sec = sum(segment_durations)
                 logger.info("使用按段 TTS，语音与场景时间点对齐，总时长 %.1f 秒", duration_sec)
@@ -2138,7 +2420,7 @@ def _generate_video_mvp(
                 segment_durations = None
                 segment_texts = None
         if tts_path is None or not os.path.exists(tts_path):
-            tts_path = _synthesize_speech_aliyun(script_for_tts, voice=voice)
+            tts_path = _synthesize_speech_aliyun_with_fallback(script_for_tts, voice=voice)
             if tts_path and os.path.exists(tts_path):
                 duration_sec = _get_audio_duration_sec(tts_path)
                 logger.info("使用阿里云 TTS 配音, 时长 %.1f 秒", duration_sec)
@@ -2173,8 +2455,16 @@ def _generate_video_mvp(
             "-t", duration_str, "-movflags", "+faststart", "-y", out_path,
         ]
 
-        # 6 场景 + 按段字幕时共 12 个视频输入(0-5 场景, 6-11 字幕)，人声/BGM 顺延
+        # 6 场景 + 按段字幕时共 12 个视频输入(0-5 场景, 6-11 字幕)，人声/BGM 顺延；若叠加姓名行则多 1 个输入
         n_video_inputs = 12 if (use_six_scenes and segment_durations and segment_texts and len(segment_texts) == NUM_SCENES) else (7 if use_six_scenes else 2)
+        student_line_png_path = None
+        if STUDENT_LINE:
+            student_line_png_path = f"/tmp/ai_video_student_line_{uuid.uuid4()}.png"
+            if _render_student_line_png(STUDENT_LINE, student_line_png_path) and os.path.exists(student_line_png_path):
+                n_video_inputs += 1
+            else:
+                student_line_png_path = None
+        student_png_idx = n_video_inputs - 1 if student_line_png_path else -1
         voice_idx = n_video_inputs
         bgm_idx = n_video_inputs + 1
         # BGM 淡入淡出时长，与视频起止对齐、不抢人声
@@ -2222,26 +2512,49 @@ def _generate_video_mvp(
             else:
                 clip_dur = (duration_sec + (NUM_SCENES - 1) * XFADE_DUR) / NUM_SCENES
                 clip_durs = [clip_dur] * NUM_SCENES
-            # 按段字幕：语音、文字、视频时间点一致——每段对应一张字幕图并在该段时间内叠加
+            # 按段字幕：语音、文字、视频时间点一致；优先使用「高图+滚动」以完整显示旁白全文，与旁白语速同步
             use_per_segment_subtitles = (
                 segment_durations is not None
                 and segment_texts is not None
                 and len(segment_texts) == NUM_SCENES
             )
+            use_scrolling_subtitles = False
             if use_per_segment_subtitles:
+                segment_sub_heights = []
                 for k in range(NUM_SCENES):
                     seg_png = f"/tmp/ai_video_txt_seg_{uuid.uuid4()}_{k}.png"
-                    if _render_text_to_png(
+                    tall_h = _render_segment_text_to_tall_png(
                         (segment_texts[k] or " ").strip() or " ",
                         seg_png,
                         width=w,
-                        height=h,
                         style=style,
-                    ):
+                    )
+                    if tall_h is not None and tall_h > 0:
                         text_png_segments.append(seg_png)
+                        segment_sub_heights.append(tall_h)
                     else:
+                        segment_sub_heights.clear()
                         text_png_segments.clear()
                         break
+                if len(text_png_segments) == NUM_SCENES and len(segment_sub_heights) == NUM_SCENES:
+                    use_scrolling_subtitles = True
+                    logger.info("按段滚动字幕：旁白全文将随语速滚动显示")
+                else:
+                    segment_sub_heights = []
+                    text_png_segments.clear()
+                    for k in range(NUM_SCENES):
+                        seg_png = f"/tmp/ai_video_txt_seg_{uuid.uuid4()}_{k}.png"
+                        if _render_text_to_png(
+                            (segment_texts[k] or " ").strip() or " ",
+                            seg_png,
+                            width=w,
+                            height=h,
+                            style=style,
+                        ):
+                            text_png_segments.append(seg_png)
+                        else:
+                            text_png_segments.clear()
+                            break
             video_inputs = []
             for k, p in enumerate(scene_paths[:NUM_SCENES]):
                 video_inputs += ["-loop", "1", "-t", str(clip_durs[k]), "-i", p]
@@ -2250,6 +2563,8 @@ def _generate_video_mvp(
                     video_inputs += ["-loop", "1", "-t", str(clip_durs[k]), "-i", text_png_segments[k]]
             else:
                 video_inputs += ["-loop", "1", "-t", duration_str, "-i", text_png]
+            if student_line_png_path:
+                video_inputs += ["-loop", "1", "-t", duration_str, "-i", student_line_png_path]
             zoom_end = 1.11 if is_blockbuster else 1.08
             zoom_rate = 0.00022 if is_blockbuster else 0.00018
             pan_x, pan_y = (0.06, 0.03) if is_blockbuster else (0.04, 0.02)
@@ -2279,7 +2594,7 @@ def _generate_video_mvp(
                 % vignette
             )
             if use_per_segment_subtitles and len(text_png_segments) == NUM_SCENES:
-                # 字幕与语音节点严格对齐：有 TTS 分段时用 segment_durations 作为每段字幕的起止，与播放一致
+                # 字幕与语音节点严格对齐；滚动字幕时 y 随 t 从底部滚到顶部，与旁白语速一致
                 if segment_durations and len(segment_durations) == NUM_SCENES:
                     sub_starts = [0.0]
                     for k in range(1, NUM_SCENES):
@@ -2299,18 +2614,26 @@ def _generate_video_mvp(
                         "[%d:v]fade=t=in:st=0:d=%s:alpha=1[t%d];"
                         % (NUM_SCENES + k, SUBTITLE_FADE_IN_DUR, k)
                     )
-                # 统一底部安全区，不挡画面、适合商用
-                sub_y_expr = "H-h-%d" % SUBTITLE_BOTTOM_MARGIN_PX
                 prev = "[v05b]"
                 for k in range(NUM_SCENES):
                     t_start = sub_starts[k]
                     t_end = sub_ends[k]
+                    seg_dur = segment_durations[k] if (segment_durations and k < len(segment_durations)) else (sub_ends[k] - sub_starts[k])
                     enable_expr = "between(t,%s,%s)" % (t_start, t_end)
-                    out_label = "[v]" if k == NUM_SCENES - 1 else "[va%d]" % k
-                    overlay_parts.append(
-                        "%s[t%d]overlay=(W-w)/2:%s:enable='%s'%s;"
-                        % (prev, k, sub_y_expr, enable_expr, out_label)
-                    )
+                    out_label = "[vpre]" if k == NUM_SCENES - 1 else "[va%d]" % k
+                    if use_scrolling_subtitles and seg_dur > 0:
+                        # 滚动：y 从 H-h 到 0，与旁白时长一致，全文随语速从下往上滚
+                        sub_y_expr = "(H-h)*(1-(t-%s)/%s)" % (t_start, seg_dur)
+                        overlay_parts.append(
+                            "%s[t%d]overlay=x=(W-w)/2:y='%s':enable='%s'%s;"
+                            % (prev, k, sub_y_expr, enable_expr, out_label)
+                        )
+                    else:
+                        sub_y_expr = "H-h-%d" % SUBTITLE_BOTTOM_MARGIN_PX
+                        overlay_parts.append(
+                            "%s[t%d]overlay=(W-w)/2:%s:enable='%s'%s;"
+                            % (prev, k, sub_y_expr, enable_expr, out_label)
+                        )
                     prev = out_label
                 filter_v = base_v + ";" + "".join(overlay_parts).rstrip(";")
             else:
@@ -2318,10 +2641,12 @@ def _generate_video_mvp(
                 sub_pos = "(W-w)/2:H-h-%d" % SUBTITLE_BOTTOM_MARGIN_PX
                 filter_v = (
                     base_v + ";"
-                    + "[%d:v]fade=t=in:st=0:d=%s:alpha=1[txt];[v05b][txt]overlay=%s[v]" % (NUM_SCENES, SUBTITLE_FADE_IN_DUR, sub_pos)
+                    + "[%d:v]fade=t=in:st=0:d=%s:alpha=1[txt];[v05b][txt]overlay=%s[vpre]" % (NUM_SCENES, SUBTITLE_FADE_IN_DUR, sub_pos)
                 )
         elif has_bg and os.path.exists(bg_png):
             video_inputs = ["-loop", "1", "-i", bg_png, "-loop", "1", "-i", text_png]
+            if student_line_png_path:
+                video_inputs += ["-loop", "1", "-t", duration_str, "-i", student_line_png_path]
             # 广告大片感：缓慢 zoom；好莱坞大片 1→1.15 推进更强
             z_end = 1.15 if is_blockbuster else 1.12
             z_rate = 0.00026 if is_blockbuster else 0.00022
@@ -2332,22 +2657,31 @@ def _generate_video_mvp(
                 f"x='iw/2-(iw/2/zoom)+0.06*on':y='ih/2-(ih/2/zoom)+0.03*on':"
                 f"d={n_frames}:s={s_param}[v0];"
                 "[v0]geq=lum='lum(X,Y)*(1-%.2f*(pow(X-W/2,2)+pow(Y-H/2,2))/(pow(W/2,2)+pow(H/2,2)))':cb='cb(X,Y)':cr='cr(X,Y)'[v0b];"
-                "[1:v]fade=t=in:st=0:d=%s:alpha=1[txt];[v0b][txt]overlay=%s[v]" % (v_strength, SUBTITLE_FADE_IN_DUR, sub_pos)
+                "[1:v]fade=t=in:st=0:d=%s:alpha=1[txt];[v0b][txt]overlay=%s[vpre]" % (v_strength, SUBTITLE_FADE_IN_DUR, sub_pos)
             )
         else:
             video_inputs = [
                 "-f", "lavfi", "-i", f"color=c=0x1a2b3c:s={s_param}:d={duration_str}",
                 "-loop", "1", "-i", text_png,
             ]
+            if student_line_png_path:
+                video_inputs += ["-loop", "1", "-t", duration_str, "-i", student_line_png_path]
             sub_pos = "(W-w)/2:H-h-%d" % SUBTITLE_BOTTOM_MARGIN_PX
-            filter_v = "[0:v][1:v]overlay=%s:shortest=1[v]" % sub_pos
+            filter_v = "[0:v][1:v]overlay=%s:shortest=1[vpre]" % sub_pos
+        # 每镜叠加固定文字（如姓名班级）：用 PIL 生成的 PNG overlay，避免 drawtext 字体/exit 8 问题
+        if student_line_png_path and student_png_idx >= 0:
+            filter_v = filter_v.rstrip(";") + ";[vpre][%d:v]overlay=24:24[v]" % student_png_idx
+        else:
+            filter_v = filter_v.replace("[vpre]", "[v]")
         filter_complex = filter_v + ((";" + filter_a) if filter_a else "")
         cmd = ["ffmpeg"] + video_inputs + audio_input + ["-filter_complex", filter_complex] + map_opts + out_opts
         r = run_ffmpeg(cmd)
         if r.returncode == 0:
-            return out_path
+            return (out_path, persisted_scene_urls)
         err = (r.stderr or b"").decode("utf-8", errors="replace").strip()
-        raise RuntimeError(f"FFmpeg 失败 (exit {r.returncode}): {err[:500]}")
+        # 错误信息多在 stderr 末尾，取后 1200 字符便于排查
+        err_tail = err[-1200:] if len(err) > 1200 else err
+        raise RuntimeError(f"FFmpeg 失败 (exit {r.returncode}): {err_tail}")
     except FileNotFoundError as e:
         raise RuntimeError("未检测到 FFmpeg，请安装: brew install ffmpeg") from e
     except subprocess.TimeoutExpired as e:
@@ -2359,18 +2693,24 @@ def _generate_video_mvp(
                     os.remove(p)
             except OSError:
                 pass
+        if student_line_png_path and os.path.exists(student_line_png_path):
+            try:
+                os.remove(student_line_png_path)
+            except OSError:
+                pass
         for p in text_png_segments:
             try:
                 if os.path.exists(p):
                     os.remove(p)
             except OSError:
                 pass
-        for p in scene_paths:
-            try:
-                if os.path.exists(p):
-                    os.remove(p)
-            except OSError:
-                pass
+        if not reused_scene_paths and scene_dir:
+            for p in scene_paths:
+                try:
+                    if p and os.path.exists(p) and p.startswith(scene_dir):
+                        os.remove(p)
+                except OSError:
+                    pass
         if scene_dir and os.path.isdir(scene_dir):
             try:
                 import shutil
@@ -2415,7 +2755,7 @@ def _generate_video_mvp(
         out_path = f"/tmp/ai_video_{uuid.uuid4()}.mp4"
         video.write_videofile(out_path, fps=fps, codec="libx264", audio=False)
         video.close()
-        return out_path
+        return (out_path, None)
 
     except ImportError:
         raise RuntimeError("未安装 MoviePy 且 FFmpeg 不可用，请安装: brew install ffmpeg")

@@ -19,6 +19,16 @@ export default function DashboardPage() {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
   const [backendOk, setBackendOk] = useState<boolean | null>(null);
+  /** 主题生成 | 自定义旁白（完整文案 + 六镜描述） */
+  const [createMode, setCreateMode] = useState<'theme' | 'custom'>('theme');
+  const [scriptText, setScriptText] = useState('');
+  const [sceneDescriptions, setSceneDescriptions] = useState<string[]>(() => Array(6).fill(''));
+  /** 再用一次时带上该 task_id，后端复用该任务的 6 张场景图 */
+  const [reuseFromTaskId, setReuseFromTaskId] = useState<string | null>(null);
+  /** 自定义旁白：每镜可单独上传背景图（不填则按描述生成） */
+  const [sceneImages, setSceneImages] = useState<(File | null)[]>(() => Array(6).fill(null));
+  /** 仅用即梦 AI 重绘第 N 镜背景（1~6），空为不重绘；常用于「再用一次」时只重绘场景二等 */
+  const [regenerateSceneIndexWithJimeng, setRegenerateSceneIndexWithJimeng] = useState<string>('');
 
   const fetchUser = async () => {
     try {
@@ -32,7 +42,7 @@ export default function DashboardPage() {
         return;
       }
       localStorage.removeItem('token');
-      router.replace('/login?expired=1');
+      window.location.replace('/login?expired=1');
     }
   };
 
@@ -50,7 +60,7 @@ export default function DashboardPage() {
     let cancelled = false;
     const token = typeof window !== 'undefined' ? localStorage.getItem('token') : null;
     if (!token) {
-      router.replace('/login');
+      window.location.replace('/login');
       return;
     }
     checkBackendHealth().then((ok) => { if (!cancelled) setBackendOk(ok); });
@@ -76,14 +86,46 @@ export default function DashboardPage() {
       setError('请输入视频主题');
       return;
     }
+    if (createMode === 'custom') {
+      if (!scriptText.trim()) {
+        setError('请输入旁白全文');
+        return;
+      }
+      const scenes = sceneDescriptions.map((s) => (s || '').trim());
+      if (scenes.length !== 6 || scenes.some((s) => !s)) {
+        setError('请填写完整六镜场景描述（共 6 条）');
+        return;
+      }
+    }
     setError('');
     setSubmitting(true);
     try {
-      const created = await tasksApi.create(theme, 'default', image || undefined, voice, style || undefined, bgm || undefined);
-      // 乐观更新：立即把新任务插入列表顶部，用户不用等轮询即看到「生成中」
+      const options: { script_text?: string; scene_descriptions?: string[]; reuse_from_task_id?: string; scene_images?: (File | null)[]; regenerate_scene_index_with_jimeng?: string } =
+        createMode === 'custom' && scriptText.trim() && sceneDescriptions.every((s) => (s || '').trim())
+          ? { script_text: scriptText.trim(), scene_descriptions: sceneDescriptions.map((s) => (s || '').trim()) }
+          : {};
+      if (reuseFromTaskId) options.reuse_from_task_id = reuseFromTaskId;
+      if (createMode === 'custom' && sceneImages.some((f) => f != null)) options.scene_images = sceneImages;
+      if (regenerateSceneIndexWithJimeng && /^[1-6]$/.test(regenerateSceneIndexWithJimeng)) options.regenerate_scene_index_with_jimeng = regenerateSceneIndexWithJimeng;
+      const created = await tasksApi.create(
+        theme,
+        'default',
+        image || undefined,
+        voice,
+        style || undefined,
+        bgm || undefined,
+        Object.keys(options).length ? options : undefined
+      );
       setTasks((prev) => [created, ...prev.filter((t) => t.task_id !== created.task_id)]);
       setTotal((prev) => prev + 1);
       setTheme('');
+      setReuseFromTaskId(null);
+      setRegenerateSceneIndexWithJimeng('');
+      if (createMode === 'custom') {
+        setScriptText('');
+        setSceneDescriptions(Array(6).fill(''));
+        setSceneImages(Array(6).fill(null));
+      }
       await fetchUser();
       await fetchTasks();
     } catch (err: unknown) {
@@ -91,7 +133,7 @@ export default function DashboardPage() {
       setError(msg);
       if (msg.includes('登录已过期') || msg.includes('无效的认证凭据')) {
         localStorage.removeItem('token');
-        router.replace('/login?expired=1');
+        window.location.replace('/login?expired=1');
       }
     } finally {
       setSubmitting(false);
@@ -100,7 +142,7 @@ export default function DashboardPage() {
 
   const handleLogout = () => {
     localStorage.removeItem('token');
-    router.replace('/login');
+    window.location.replace('/login');
   };
 
   if (loading) {
@@ -165,18 +207,99 @@ export default function DashboardPage() {
               输入主题或上传图片，由 AI 自动生成广告大片：1080p 电影级输出、史诗感镜头与转场、高端文案 + 真人配音，一键生成专业级短视频
             </p>
             <form onSubmit={handleSubmit} className="space-y-4">
+              <div className="flex gap-2 mb-2">
+                <button
+                  type="button"
+                  onClick={() => setCreateMode('theme')}
+                  className={`px-4 py-2 rounded-lg text-sm font-medium transition ${
+                    createMode === 'theme'
+                      ? 'bg-blue-500 text-white'
+                      : 'bg-slate-700 text-slate-400 hover:bg-slate-600'
+                  }`}
+                >
+                  主题生成
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setCreateMode('custom')}
+                  className={`px-4 py-2 rounded-lg text-sm font-medium transition ${
+                    createMode === 'custom'
+                      ? 'bg-blue-500 text-white'
+                      : 'bg-slate-700 text-slate-400 hover:bg-slate-600'
+                  }`}
+                >
+                  自定义旁白
+                </button>
+              </div>
+              <p className="text-slate-500 text-xs mb-2">
+                {createMode === 'theme'
+                  ? '输入主题由 AI 生成 6 镜旁白与画面。'
+                  : '填写完整旁白与六镜场景描述，视频将按你的文案一字不差生成，适合故事、演讲等。'}
+              </p>
               <div>
                 <label className="block text-sm text-slate-400 mb-2">
-                  视频主题
+                  {createMode === 'theme' ? '视频主题' : '视频标题（简短，用于任务名称）'}
                 </label>
                 <input
                   type="text"
                   value={theme}
                   onChange={(e) => setTheme(e.target.value)}
-                  placeholder="例如：高端智能手表、新能源汽车、轻奢生活方式"
+                  placeholder={createMode === 'theme' ? '例如：高端智能手表、新能源汽车、轻奢生活方式' : '例如：时钟小镇的快递任务'}
                   className="w-full px-4 py-3 rounded-lg bg-slate-800 border border-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-500"
                 />
               </div>
+              {createMode === 'custom' && (
+                <>
+                  <div>
+                    <label className="block text-sm text-slate-400 mb-2">
+                      旁白全文（将按句分 6 镜配音，建议 6 段左右）
+                    </label>
+                    <textarea
+                      value={scriptText}
+                      onChange={(e) => setScriptText(e.target.value)}
+                      placeholder="在很远的地方有一座神奇的时钟小镇……"
+                      rows={6}
+                      className="w-full px-4 py-3 rounded-lg bg-slate-800 border border-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-500 resize-y"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm text-slate-400 mb-2">
+                      六镜场景描述（每镜 10～30 字，用于生成对应背景图）
+                    </label>
+                    <div className="space-y-2">
+                      {[0, 1, 2, 3, 4, 5].map((i) => (
+                        <div key={i} className="space-y-1">
+                          <input
+                            type="text"
+                            value={sceneDescriptions[i] ?? ''}
+                            onChange={(e) => {
+                              const next = [...sceneDescriptions];
+                              next[i] = e.target.value;
+                              setSceneDescriptions(next);
+                            }}
+                            placeholder={`第 ${i + 1} 镜：如 童话风时钟小镇与快递员`}
+                            className="w-full px-4 py-2 rounded-lg bg-slate-800 border border-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
+                          />
+                          <div className="flex items-center gap-2">
+                            <span className="text-slate-500 text-xs shrink-0">本镜背景图（选填）：</span>
+                            <input
+                              type="file"
+                              accept="image/*"
+                              className="flex-1 max-w-xs text-slate-400 text-xs file:mr-2 file:py-1 file:px-2 file:rounded file:border-0 file:bg-slate-600 file:text-white"
+                              onChange={(e) => {
+                                const next = [...sceneImages];
+                                next[i] = e.target.files?.[0] || null;
+                                setSceneImages(next);
+                              }}
+                            />
+                            {sceneImages[i] && <span className="text-green-400 text-xs">已选</span>}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </>
+              )}
               <div>
                 <label className="block text-sm text-slate-400 mb-2">
                   大片风格
@@ -243,25 +366,68 @@ export default function DashboardPage() {
                 />
                 {image && <p className="text-green-400 text-xs mt-1">已选: {image.name}</p>}
               </div>
+              {reuseFromTaskId && (
+                <div>
+                  <label className="block text-sm text-slate-400 mb-2">
+                    仅用即梦 AI 重绘某一镜背景
+                  </label>
+                  <select
+                    value={regenerateSceneIndexWithJimeng}
+                    onChange={(e) => setRegenerateSceneIndexWithJimeng(e.target.value)}
+                    className="w-full px-4 py-3 rounded-lg bg-slate-800 border border-slate-700 text-slate-200"
+                  >
+                    <option value="">不重绘，全部沿用原图</option>
+                    {[1, 2, 3, 4, 5, 6].map((n) => (
+                      <option key={n} value={String(n)}>仅重绘第{n}镜（即梦生成）</option>
+                    ))}
+                  </select>
+                  <p className="text-slate-500 text-xs mt-1">仅在「再用一次」时生效：仅该镜即梦重绘，其余 5 镜沿用本条历史自带的场景图</p>
+                </div>
+              )}
               {error && <p className="text-red-400 text-sm">{error}</p>}
               <button
                 type="submit"
                 disabled={submitting || (user?.credits ?? 0) <= 0}
-                className="w-full py-3 bg-blue-500 rounded-lg font-medium hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed transition"
+                className="w-full py-3 bg-blue-500 rounded-lg font-medium hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed transition flex items-center justify-center gap-2"
               >
-                {submitting ? 'AI 生成中...' : 'AI 生成视频'}
+                {submitting && (
+                  <span className="inline-block w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" aria-hidden />
+                )}
+                {submitting ? 'AI 正在生成视频…' : 'AI 生成视频'}
               </button>
             </form>
           </div>
 
           <div>
-            <h2 className="text-xl font-bold mb-4">我的任务</h2>
+            <h2 className="text-xl font-bold mb-1">生成历史</h2>
+            <p className="text-slate-500 text-xs mb-3">点击「再用一次」可带出该条的主题、旁白与六镜场景，直接重新生成</p>
             <div className="space-y-3 max-h-[500px] overflow-y-auto">
               {tasks.length === 0 ? (
                 <p className="text-slate-500 text-sm">暂无任务</p>
               ) : (
                 tasks.map((task) => (
-                  <TaskCard key={task.task_id} task={task} onRefresh={fetchTasks} />
+                  <TaskCard
+                    key={task.task_id}
+                    task={task}
+                    onRefresh={fetchTasks}
+                    onReuse={() => {
+                      setTheme(task.theme || '');
+                      setScriptText(task.script_text || '');
+                      setSceneDescriptions(
+                        Array.isArray(task.scene_descriptions) && task.scene_descriptions.length === 6
+                          ? [...task.scene_descriptions]
+                          : Array(6).fill('')
+                      );
+                      setVoice(task.voice || 'ruoxi');
+                      setStyle(task.style || '');
+                      setBgm(task.bgm || '');
+                      setCreateMode((task.script_text && task.script_text.trim()) ? 'custom' : 'theme');
+                      setReuseFromTaskId(task.task_id);
+                      setSceneImages(Array(6).fill(null));
+                      setError('');
+                      window.scrollTo({ top: 0, behavior: 'smooth' });
+                    }}
+                  />
                 ))
               )}
             </div>
@@ -275,10 +441,15 @@ export default function DashboardPage() {
 function TaskCard({
   task,
   onRefresh,
+  onReuse,
 }: {
   task: Task;
   onRefresh: () => void;
+  onReuse?: () => void;
 }) {
+  const [downloading, setDownloading] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [downloadHintShown, setDownloadHintShown] = useState(false);
   const statusMap: Record<string, string> = {
     pending: '排队中',
     processing: '生成中',
@@ -293,20 +464,26 @@ function TaskCard({
   };
 
   const themeDisplay = task.theme.length > 42 ? `${task.theme.slice(0, 42)}…` : task.theme;
-  const createdStr = task.created_at
-    ? (() => {
-        try {
-          const d = new Date(task.created_at);
-          const sec = (Date.now() - d.getTime()) / 1000;
-          if (sec < 60) return '刚刚';
-          if (sec < 3600) return `${Math.floor(sec / 60)} 分钟前`;
-          if (sec < 86400) return `${Math.floor(sec / 3600)} 小时前`;
-          return d.toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-        } catch {
-          return '';
-        }
-      })()
-    : '';
+  const [createdStr, setCreatedStr] = useState('');
+  useEffect(() => {
+    if (!task.created_at) {
+      setCreatedStr('');
+      return;
+    }
+    try {
+      // 后端存的是 UTC，若没有时区后缀则按 UTC 解析，避免差 8 小时
+      let iso = String(task.created_at).trim();
+      if (iso && !/Z|[+-]\d{2}:?\d{2}$/.test(iso)) iso = iso + 'Z';
+      const d = new Date(iso);
+      const sec = (Date.now() - d.getTime()) / 1000;
+      if (sec < 60) setCreatedStr('刚刚');
+      else if (sec < 3600) setCreatedStr(`${Math.floor(sec / 60)} 分钟前`);
+      else if (sec < 86400) setCreatedStr(`${Math.floor(sec / 3600)} 小时前`);
+      else setCreatedStr(d.toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }));
+    } catch {
+      setCreatedStr('');
+    }
+  }, [task.created_at]);
 
   return (
     <div className="p-4 rounded-lg bg-slate-800 border border-slate-700">
@@ -314,6 +491,9 @@ function TaskCard({
         {themeDisplay}
       </p>
       <div className="flex items-center gap-2 mt-1 flex-wrap">
+        {(task.status === 'pending' || task.status === 'processing') && (
+          <span className="inline-block w-4 h-4 border-2 border-current border-t-transparent rounded-full animate-spin opacity-80" aria-hidden />
+        )}
         <span className={`text-sm ${statusColor[task.status]}`}>
           {statusMap[task.status]}
         </span>
@@ -324,15 +504,102 @@ function TaskCard({
       {task.status === 'failed' && task.error_message && (
         <p className="text-xs mt-1 text-red-300 break-words">{task.error_message}</p>
       )}
+      {onReuse && (
+        <div className="mt-2">
+          <button
+            type="button"
+            onClick={() => onReuse()}
+            className="px-3 py-1.5 text-sm bg-emerald-600/80 rounded hover:bg-emerald-600 transition"
+          >
+            再用一次
+          </button>
+        </div>
+      )}
       {task.status === 'completed' && task.video_url && (
-        <a
-          href={getVideoProxyUrl(task.video_url) ?? task.video_url}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="mt-2 inline-block px-3 py-1 text-sm bg-blue-500 rounded hover:bg-blue-600 transition"
-        >
-          下载视频
-        </a>
+        <div className="mt-2 flex flex-wrap gap-2">
+          <button
+            type="button"
+            disabled={downloading}
+            onClick={async () => {
+              setDownloading(true);
+              try {
+                const { download_url } = await tasksApi.getDownloadLink(task.task_id);
+                const base = typeof window !== 'undefined' ? '/api/backend' : '';
+                const fullUrl = base + download_url;
+                const opened = window.open(fullUrl, '_blank', 'noopener');
+                if (!opened) window.location.href = fullUrl;
+                setDownloadHintShown(true);
+                setTimeout(() => setDownloadHintShown(false), 4000);
+              } catch (e) {
+                console.error(e);
+                const fallback = getVideoProxyUrl(task.video_url) ?? task.video_url;
+                if (fallback) window.open(fallback, '_blank');
+              } finally {
+                setDownloading(false);
+              }
+            }}
+            className="px-3 py-1.5 text-sm bg-blue-500 rounded hover:bg-blue-600 disabled:opacity-50 transition"
+          >
+            {downloading ? '准备下载…' : '下载到本地'}
+          </button>
+          <a
+            href={getVideoProxyUrl(task.video_url) ?? task.video_url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="px-3 py-1.5 text-sm bg-slate-600 rounded hover:bg-slate-500 transition inline-block"
+          >
+            新窗口播放
+          </a>
+          <button
+            type="button"
+            disabled={deleting}
+            onClick={async () => {
+              if (!confirm('确定要删除这条视频吗？')) return;
+              setDeleting(true);
+              try {
+                await tasksApi.delete(task.task_id);
+                onRefresh();
+              } catch (e) {
+                console.error(e);
+                alert('删除失败，请稍后重试');
+              } finally {
+                setDeleting(false);
+              }
+            }}
+            className="px-3 py-1.5 text-sm bg-red-600/80 rounded hover:bg-red-600 disabled:opacity-50 transition"
+          >
+            {deleting ? '删除中…' : '删除'}
+          </button>
+        </div>
+      )}
+      {downloadHintShown && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 px-4 py-3 rounded-lg bg-slate-700/95 text-white text-sm shadow-xl animate-fade-in border border-slate-600">
+          下载链接已打开，请在新标签页中保存到手机/电脑
+        </div>
+      )}
+      {task.status !== 'completed' && (
+        <div className="mt-2">
+          <button
+            type="button"
+            disabled={deleting}
+            onClick={async () => {
+              if (!confirm('确定要删除这条任务吗？')) return;
+              setDeleting(true);
+              try {
+                await tasksApi.delete(task.task_id);
+                onRefresh();
+              } catch (e) {
+                console.error(e);
+                alert('删除失败，请稍后重试');
+              } finally {
+                setDeleting(false);
+              }
+            }}
+            className="px-3 py-1.5 text-sm bg-slate-600 rounded hover:bg-red-600/80 disabled:opacity-50 transition"
+          >
+            {deleting ? '删除中…' : '删除'}
+          </button>
+        </div>
       )}
     </div>
   );

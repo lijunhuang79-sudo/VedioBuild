@@ -29,7 +29,7 @@ export default function RootLayout({
 }) {
   return (
     <html lang="zh-CN">
-      <body className="min-h-screen antialiased">{children}</body>
+      <body className="min-h-screen antialiased bg-slate-900 text-white" style={{ backgroundColor: '#0f172a', color: '#fff' }}>{children}</body>
     </html>
   );
 }

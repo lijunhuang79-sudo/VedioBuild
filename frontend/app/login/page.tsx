@@ -1,11 +1,11 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, Suspense } from 'react';
 import { useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { authApi } from '@/lib/api';
 
-export default function LoginPage() {
+function LoginForm() {
   const searchParams = useSearchParams();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -84,7 +84,22 @@ export default function LoginPage() {
         <p className="mt-2 text-center text-slate-500 text-xs">
           请确认后端已启动（如 scripts/start-backend.sh）
         </p>
+        <p className="mt-2 text-center text-slate-400 text-xs">
+          试用账号：<code className="bg-white/10 px-1 rounded">test@test.com</code> / <code className="bg-white/10 px-1 rounded">123456</code>
+        </p>
       </div>
     </div>
+  );
+}
+
+export default function LoginPage() {
+  return (
+    <Suspense fallback={
+      <div className="min-h-screen bg-gradient-to-br from-slate-900 via-blue-900 to-slate-900 flex items-center justify-center">
+        <span className="text-slate-400">加载中...</span>
+      </div>
+    }>
+      <LoginForm />
+    </Suspense>
   );
 }

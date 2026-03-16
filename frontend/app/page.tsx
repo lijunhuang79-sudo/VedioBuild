@@ -1,15 +1,14 @@
 'use client';
 
 import { useEffect } from 'react';
-import { useRouter } from 'next/navigation';
 
-/** 暂时去除注册/登录落地页，方便测试：首页直接进入 dashboard，未登录则由 dashboard 跳转登录 */
+/** 首页直接进工作台，未登录则由 dashboard 跳转登录；用 window.location 避免 IP 访问时白屏 */
 export default function Home() {
-  const router = useRouter();
-
   useEffect(() => {
-    router.replace('/dashboard');
-  }, [router]);
+    if (typeof window !== 'undefined') {
+      window.location.replace('/dashboard');
+    }
+  }, []);
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-slate-900 text-white">

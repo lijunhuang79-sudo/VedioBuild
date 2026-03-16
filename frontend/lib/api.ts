@@ -1,10 +1,11 @@
 /**
  * API 客户端
- * 浏览器端请求同源 /api-backend，由 Next 代理到后端，避免「无法连接服务器」
+ * 浏览器端请求同源 /api/backend，由 Next API Route 转发到后端，确保 POST 请求体正确转发（登录等）
  */
+// 浏览器用 /api/backend，由 Next API Route 转发请求体，避免 rewrites 在开发模式下不转发 POST body 导致登录失败
 const API_BASE =
   typeof window !== 'undefined'
-    ? '/api-backend'  // 浏览器：同源代理 -> 后端 /api
+    ? '/api/backend'
     : (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000');
 
 function getToken(): string | null {
@@ -40,7 +41,7 @@ export async function api<T>(
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     if (msg === 'Failed to fetch' || msg.includes('Load failed') || msg.includes('NetworkError')) {
-      const hint = API_BASE.startsWith('/') ? '请确认后端已启动 (http://localhost:8000)' : `请确认后端已启动：${API_BASE}`;
+      const hint = '请确认后端已启动 (http://localhost:8000)';
       throw new Error(`无法连接服务器，${hint}`);
     }
     throw e;
@@ -56,14 +57,14 @@ export async function api<T>(
 
 /**
  * 将后端返回的视频 URL 转为通过前端代理访问，便于手机/局域网访问。
- * 例如 http://localhost:8000/static/videos/xxx.mp4 -> /api-backend/static/videos/xxx.mp4
+ * 例如 http://localhost:8000/static/videos/xxx.mp4 -> /api/backend/static/videos/xxx.mp4
  */
 export function getVideoProxyUrl(videoUrl: string | null | undefined): string | null {
   if (!videoUrl?.trim()) return null;
   try {
     const u = new URL(videoUrl, window.location.origin);
     const path = u.pathname;
-    if (path.startsWith('/static/videos/')) return `/api-backend${path}`;
+    if (path.startsWith('/static/videos/')) return `/api/backend${path}`;
     return videoUrl;
   } catch {
     return videoUrl;
@@ -73,7 +74,7 @@ export function getVideoProxyUrl(videoUrl: string | null | undefined): string | 
 /** 检查后端是否可连接（用于仪表盘显示状态） */
 export async function checkBackendHealth(): Promise<boolean> {
   try {
-    const base = typeof window !== 'undefined' ? '/api-backend' : (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000');
+    const base = typeof window !== 'undefined' ? '/api/backend' : (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000');
     const r = await fetch(`${base}/health`);
     return r.ok;
   } catch {
@@ -96,7 +97,7 @@ export const authApi = {
   me: () => api<User>('/api/auth/me'),
 };
 
-/** 可选配音音色（阿里云 TTS），优先推荐自然/多情感音色，减少 AI 感 */
+/** 可选配音音色（阿里云 TTS），优先推荐自然/多情感音色，减少 AI 感；含童声适合故事/演讲 */
 export const TTS_VOICES = [
   { value: 'ruoxi', label: '若兮 · 温柔自然（推荐）' },
   { value: 'zhimi_emo', label: '知米 · 多情感女声（推荐）' },
@@ -113,6 +114,18 @@ export const TTS_VOICES = [
   { value: 'sicheng', label: '思诚 · 男声' },
   { value: 'xiaogang', label: '小刚 · 标准男声' },
   { value: 'zhifeng_emo', label: '知锋 · 多情感男声' },
+  // 童声（故事/数学演讲等；需在阿里云控制台开通对应音色）
+  { value: 'aitong', label: '艾彤 · 童声女' },
+  { value: 'aiwei', label: '艾薇 · 童声女' },
+  { value: 'aibao', label: '艾宝 · 童声' },
+  { value: 'longtong', label: '龙彤 · 童声' },
+  { value: 'longxiaoxuan', label: '龙小萱 · 童声' },
+  { value: 'xiaobei', label: '小贝 · 可爱童声' },
+  { value: 'longhuhu', label: '龙呼呼 · 童声女' },
+  { value: 'longpaopao', label: '龙泡泡 · 童声' },
+  { value: 'longjielidou', label: '龙傑力豆 · 童声男' },
+  { value: 'longxian', label: '龙仙 · 童声' },
+  { value: 'longling', label: '龙鈴 · 童声' },
 ] as const;
 
 /** 广告大片风格：影响文案语气与画面质感 */
@@ -138,7 +151,22 @@ export const BGM_OPTIONS = [
 
 // 任务
 export const tasksApi = {
-  create: (theme: string, template: string, image?: File, voice?: string, style?: string, bgm?: string) => {
+  create: (
+    theme: string,
+    template: string,
+    image?: File,
+    voice?: string,
+    style?: string,
+    bgm?: string,
+    options?: {
+      script_text?: string;
+      scene_descriptions?: string[];
+      reuse_from_task_id?: string;
+      scene_images?: (File | null)[];
+      /** 仅用即梦重绘第 N 镜（1~6），不传则不重绘 */
+      regenerate_scene_index_with_jimeng?: string;
+    }
+  ) => {
     const form = new FormData();
     form.append('theme', theme);
     form.append('template', template);
@@ -146,6 +174,19 @@ export const tasksApi = {
     if (style) form.append('style', style);
     if (bgm) form.append('bgm', bgm);
     if (image) form.append('image', image);
+    if (options?.script_text?.trim()) form.append('script_text', options.script_text.trim());
+    if (options?.scene_descriptions && options.scene_descriptions.length === 6) {
+      form.append('scene_descriptions', JSON.stringify(options.scene_descriptions.map((s) => (s || '').trim())));
+    }
+    if (options?.reuse_from_task_id?.trim()) form.append('reuse_from_task_id', options.reuse_from_task_id.trim());
+    if (options?.scene_images && options.scene_images.length === 6) {
+      options.scene_images.forEach((file, i) => {
+        if (file) form.append(`scene_image_${i}`, file);
+      });
+    }
+    if (options?.regenerate_scene_index_with_jimeng && /^[1-6]$/.test(options.regenerate_scene_index_with_jimeng)) {
+      form.append('regenerate_scene_index_with_jimeng', options.regenerate_scene_index_with_jimeng);
+    }
     return api<Task>('/api/tasks', {
       method: 'POST',
       body: form,
@@ -154,6 +195,11 @@ export const tasksApi = {
   get: (taskId: string) => api<Task>(`/api/tasks/${taskId}`),
   list: (skip = 0, limit = 20) =>
     api<{ tasks: Task[]; total: number }>(`/api/tasks?skip=${skip}&limit=${limit}`),
+  delete: (taskId: string) =>
+    api<{ ok: boolean; detail?: string }>(`/api/tasks/${taskId}`, { method: 'DELETE' }),
+  /** 获取一次性下载链接（用于手机等：跳转该链接即可触发保存） */
+  getDownloadLink: (taskId: string) =>
+    api<{ download_url: string }>(`/api/tasks/${taskId}/download-link`, { method: 'POST' }),
 };
 
 export interface User {
@@ -173,4 +219,10 @@ export interface Task {
   video_url: string | null;
   error_message?: string | null;
   created_at: string;
+  /** 生成历史：用于「再用一次」回填 */
+  script_text?: string | null;
+  scene_descriptions?: string[] | null;
+  voice?: string | null;
+  style?: string | null;
+  bgm?: string | null;
 }

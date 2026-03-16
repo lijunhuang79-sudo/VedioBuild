@@ -12,6 +12,7 @@ from .models import User
 
 settings = get_settings()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=False)
 
 # 直接使用 bcrypt，避免 passlib 在部分环境下的 72-byte 初始化报错
 try:
@@ -76,3 +77,23 @@ def get_current_user(
     if user is None:
         raise credentials_exception
     return user
+
+
+def get_optional_user(
+    token: Optional[str] = Depends(oauth2_scheme_optional),
+    db: Session = Depends(get_db),
+) -> Optional[User]:
+    """不抛错，无 token 或无效时返回 None"""
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(
+            token, settings.jwt_secret_key, algorithms=[settings.jwt_algorithm]
+        )
+        sub = payload.get("sub")
+        if sub is None:
+            return None
+        user_id = int(sub) if isinstance(sub, str) else sub
+    except (JWTError, ValueError):
+        return None
+    return db.query(User).filter(User.id == user_id).first()

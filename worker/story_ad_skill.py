@@ -30,7 +30,11 @@ def run_story_ad_skill(
     bgm: Optional[str] = None,
     script_text: Optional[str] = None,
     scene_descriptions: Optional[list] = None,
-) -> str:
+    task_id: Optional[str] = None,
+    reuse_scene_urls: Optional[list] = None,
+    custom_scene_image_paths: Optional[list] = None,
+    regenerate_scene_index_with_jimeng: Optional[int] = None,
+) -> tuple:
     """
     执行「故事化广告」全流程：生成故事文案与 6 镜场景描述 → 抓取并保存 6 张对应背景图 → 生成视频并嵌入每镜背景。
 
@@ -63,8 +67,8 @@ def run_story_ad_skill(
             scene_descriptions = story.get("scenes") if isinstance(story.get("scenes"), list) and len(story.get("scenes", [])) >= 6 else None
     logger.info("故事化广告 Skill: 文案与场景描述已就绪，共 %d 镜场景", len(scene_descriptions) if scene_descriptions else 0)
 
-    # 2) 生成视频（内部先抓取并保存 6 张故事情节背景图到任务目录，再合成每镜时显式调用这 6 张图）
-    out_path = _generate_video_mvp(
+    # 2) 生成视频（可复用 reuse_scene_urls 的 6 张图；否则抓取并保存 6 张故事情节背景图，再合成）
+    out_path, scene_urls = _generate_video_mvp(
         theme=theme,
         script_text=script_text,
         image_url=image_url,
@@ -73,5 +77,9 @@ def run_story_ad_skill(
         style=style,
         bgm=bgm,
         scene_descriptions=scene_descriptions,
+        task_id=task_id,
+        reuse_scene_urls=reuse_scene_urls,
+        custom_scene_image_paths=custom_scene_image_paths,
+        regenerate_scene_index_with_jimeng=regenerate_scene_index_with_jimeng,
     )
-    return out_path
+    return (out_path, scene_urls)

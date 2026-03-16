@@ -45,9 +45,15 @@ class VideoTask(Base):
     image_url = Column(String(512))  # 上传的图片 URL
     theme = Column(String(256))  # 用户输入的主题
     template = Column(String(64), default="default")  # 视频模板
-    
+    script_text = Column(Text)  # 自定义旁白全文，用于生成历史「再用一次」
+    scene_descriptions = Column(Text)  # JSON 数组 6 条场景描述
+    voice = Column(String(64))
+    style = Column(String(64))
+    bgm = Column(String(64))
+
     # 输出
     video_url = Column(String(512))  # 生成的视频 URL
+    scene_urls = Column(Text)  # JSON 数组 6 张场景图 URL，用于「再用一次」时复用同一套场景
     status = Column(String(20), default=TaskStatus.PENDING.value)
     error_message = Column(Text)  # 失败时的错误信息
     

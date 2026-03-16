@@ -1,12 +1,10 @@
 'use client';
 
 import { useState } from 'react';
-import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { authApi } from '@/lib/api';
 
 export default function RegisterPage() {
-  const router = useRouter();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
@@ -18,8 +16,13 @@ export default function RegisterPage() {
     setLoading(true);
     try {
       const res = await authApi.register(email, password);
-      localStorage.setItem('token', res.access_token);
-      router.push('/dashboard');
+      const token = res?.access_token;
+      if (!token) {
+        setError('注册返回异常，请重试');
+        return;
+      }
+      localStorage.setItem('token', token);
+      window.location.href = '/dashboard';
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : '注册失败，请稍后重试');
     } finally {

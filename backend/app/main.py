@@ -1,6 +1,18 @@
 """FastAPI 主应用"""
 import logging
 import os
+from pathlib import Path
+
+# 加载项目根目录 .env，保证即梦、阿里云 TTS 等环境变量在 worker 中可用（与 scripts/start-backend.sh 行为一致）
+_root = Path(__file__).resolve().parent.parent.parent
+_env_file = _root / ".env"
+if _env_file.is_file():
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(_env_file)
+    except ImportError:
+        pass
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -70,6 +82,27 @@ try:
 except Exception as e:
     logger.warning("创建表时出错（若为首次可忽略）: %s", e)
 
+# SQLite：为已有表补充「生成历史」字段（无 Alembic 时兼容旧库）
+def _add_history_columns_if_missing():
+    if "sqlite" not in settings.database_url:
+        return
+    try:
+        from sqlalchemy import text
+        for col in ("script_text", "scene_descriptions", "voice", "style", "bgm", "scene_urls"):
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(f"ALTER TABLE video_tasks ADD COLUMN {col} TEXT"))
+                logger.info("已为 video_tasks 添加列: %s", col)
+            except Exception as e:
+                if "duplicate column" in str(e).lower() or "already exists" in str(e).lower():
+                    pass
+                else:
+                    logger.debug("补充 video_tasks 列 %s 时跳过: %s", col, e)
+    except Exception as e:
+        logger.warning("补充 video_tasks 列时出错（可忽略）: %s", e)
+
+
+_add_history_columns_if_missing()
 _ensure_test_user()
 
 app = FastAPI(
@@ -96,10 +129,13 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "..", "static")
 STATIC_VIDEOS = os.path.join(STATIC_DIR, "videos")
 STATIC_IMAGES = os.path.join(STATIC_DIR, "images")
+STATIC_SCENES = os.path.join(STATIC_DIR, "scenes")
 os.makedirs(STATIC_VIDEOS, exist_ok=True)
 os.makedirs(STATIC_IMAGES, exist_ok=True)
+os.makedirs(STATIC_SCENES, exist_ok=True)
 app.mount("/static/videos", StaticFiles(directory=STATIC_VIDEOS), name="videos")
 app.mount("/static/images", StaticFiles(directory=STATIC_IMAGES), name="images")
+app.mount("/static/scenes", StaticFiles(directory=STATIC_SCENES), name="scenes")
 
 app.include_router(auth.router, prefix="/api")
 app.include_router(tasks.router, prefix="/api")
