@@ -69,6 +69,10 @@ JIYMENG_ENABLED = bool(JIYMENG_IMAGE_API_URL and JIYMENG_IMAGE_API_KEY)
 # 是否优先即梦（默认 1）；设为 0 可跳过即梦、直接用 URL 备用
 PREFER_JIMENG_SCENE = os.getenv("PREFER_JIMENG_SCENE", "1").strip() in ("1", "true", "yes")
 
+# Pixabay 图库：按主题/场景描述抓取背景图（可选；仅在提供 PIXABAY_API_KEY 时启用）
+PIXABAY_API_KEY = (os.getenv("PIXABAY_API_KEY") or "").strip()
+PIXABAY_API_URL = (os.getenv("PIXABAY_API_URL") or "https://pixabay.com/api/").rstrip("/")
+
 # 阿里万相 2.6 文生视频（DashScope 百炼）：可选试用，生成后直接返回视频路径
 DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
 WANXIANG_VIDEO_ENABLED = os.getenv("USE_WANXIANG_VIDEO", "").strip().lower() in ("1", "true", "yes")
@@ -77,8 +81,8 @@ WANXIANG_VIDEO_BASE = (os.getenv("DASHSCOPE_BASE_URL") or "https://dashscope.ali
 # FFmpeg 合成视频超时（秒）；长文案/六镜+高码率编码可能较慢，默认 10 分钟，可通过 FFMPEG_TIMEOUT_SEC 调大
 FFMPEG_TIMEOUT_SEC = max(120, int(os.getenv("FFMPEG_TIMEOUT_SEC", "600")))
 
-# 每个镜头叠加的固定文字（如姓名班级），可空字符串关闭
-STUDENT_LINE = os.getenv("VIDEO_STUDENT_LINE", "王弘毅二年级（2班）").strip()
+# 每个镜头叠加的固定文字（如姓名班级），可设 VIDEO_STUDENT_LINE 启用，默认不叠加
+STUDENT_LINE = (os.getenv("VIDEO_STUDENT_LINE") or "").strip()
 
 celery_app = Celery(
     "ai_video_factory",
@@ -110,6 +114,7 @@ def generate_video_task(
     reuse_scene_urls: Optional[list] = None,
     custom_scene_image_paths: Optional[list] = None,
     regenerate_scene_index_with_jimeng: Optional[int] = None,
+    prefer_jimeng_scene: Optional[bool] = None,
 ):
     """
     生成视频任务
@@ -163,6 +168,7 @@ def generate_video_task(
                     reuse_scene_urls=reuse_scene_urls if (reuse_scene_urls and len(reuse_scene_urls) == 6) else None,
                     custom_scene_image_paths=custom_scene_image_paths if (custom_scene_image_paths and len(custom_scene_image_paths) == 6) else None,
                     regenerate_scene_index_with_jimeng=regenerate_scene_index_with_jimeng,
+                    prefer_jimeng_scene=prefer_jimeng_scene,
                 )
             except ImportError:
                 story = _generate_story_script_with_deepseek(theme=theme, style=style)
@@ -1463,6 +1469,75 @@ def _get_library_scene_path(index: int):
     return SCENE_LIBRARY_DIR / f"lib_{num:03d}.jpg"
 
 
+def _fetch_scene_image_from_pixabay(
+    theme: Optional[str],
+    scene_description: Optional[str],
+    index: int,
+    width: int,
+    height: int,
+    save_path: str,
+) -> bool:
+    """
+    使用 Pixabay 按「主题 + 场景描述」抓取一张背景图并保存到本地。
+    仅在 PIXABAY_API_KEY 配置时启用。成功返回 True，失败返回 False。
+    """
+    if not PIXABAY_API_KEY or not PIXABAY_API_URL:
+        return False
+    query_parts = []
+    if scene_description and scene_description.strip():
+        query_parts.append(scene_description.strip())
+    if theme and theme.strip():
+        query_parts.append(theme.strip()[:40])
+    if not query_parts:
+        return False
+    q = " ".join(query_parts)
+    try:
+        import httpx
+        from urllib.parse import urlencode
+
+        params = {
+            "key": PIXABAY_API_KEY,
+            "q": q,
+            "image_type": "photo",
+            "orientation": "horizontal",
+            "safesearch": "true",
+            "per_page": 30,
+            "lang": "zh",
+        }
+        url = f"{PIXABAY_API_URL}/?{urlencode(params)}"
+        logger.info("Pixabay 抓取场景图: q=%s url=%s", q, url)
+        with httpx.Client(timeout=15.0) as client:
+            r = client.get(url)
+        if r.status_code != 200:
+            logger.warning("Pixabay 请求失败 status=%s body=%s", r.status_code, (r.text or "")[:200])
+            return False
+        data = r.json()
+        hits = data.get("hits") or []
+        if not hits:
+            logger.info("Pixabay 无结果: q=%s", q)
+            return False
+        theme_key = (theme or "").strip() or (scene_description or "").strip() or "default"
+        base_hash = abs(hash(theme_key)) if theme_key else 0
+        idx = (base_hash + index) % len(hits)
+        hit = hits[idx]
+        image_url = hit.get("largeImageURL") or hit.get("webformatURL")
+        if not image_url:
+            return False
+        import urllib.request
+
+        req = urllib.request.Request(image_url, headers={"User-Agent": "VedioBuild/1.0"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read()
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        with open(save_path, "wb") as f:
+            f.write(raw)
+        logger.info("Pixabay 已保存场景图 -> %s", save_path)
+        return True
+    except Exception as e:
+        logger.warning("Pixabay 场景图抓取失败: %s", e)
+        return False
+
+
 def _get_scene_background_image(
     index: int,
     width: int,
@@ -1471,13 +1546,16 @@ def _get_scene_background_image(
     theme: Optional[str] = None,
     scene_description: Optional[str] = None,
     apply_blur: bool = True,
+    prefer_jimeng: Optional[bool] = None,
 ) -> Optional["Image.Image"]:
     """
     获取第 index 个场景的背景图：优先读本地缓存；
     首选即梦文生图（与故事情节一致），未配置或失败时用 URL 图库备用，最后回退手绘。
+    prefer_jimeng 为 None 时使用环境变量 PREFER_JIMENG_SCENE；True/False 由请求指定。
     apply_blur=False 时不虚化（用于自定义旁白模式）。
     """
     from PIL import Image
+    use_jimeng = prefer_jimeng if prefer_jimeng is not None else PREFER_JIMENG_SCENE
     i = index % 6
     s = (style or "").strip().lower()
     suffix = s if s in ("tech", "blockbuster") else "default"
@@ -1490,34 +1568,48 @@ def _get_scene_background_image(
     if not path.exists():
         got = False
         # 首选：即梦文生图（与故事/风格一致）
-        if PREFER_JIMENG_SCENE and JIYMENG_ENABLED:
+        if use_jimeng and JIYMENG_ENABLED:
             logger.debug("第 %d 镜背景：优先即梦文生图（与故事情节一致）", i)
             prompt = _build_jimeng_prompt_for_scene(i, style, theme, scene_description=scene_description)
             got = _generate_scene_image_jimeng(prompt, width, height, str(path))
         # 第二选项：URL 图库下载（风格/主题对应 6 张图）；有场景描述时优先按描述关键词选图
         if not got:
-            if PREFER_JIMENG_SCENE and JIYMENG_ENABLED:
-                logger.info("即梦未生成第 %d 镜背景，使用 URL 图库备用", i)
-            urls = _get_scene_urls_for_style(style, theme=theme)
-            url = _get_scene_url_by_description(scene_description, i) if scene_description else None
-            if not url:
-                url = os.getenv(f"SCENE_IMAGE_URL_{i}", urls[i] if i < len(urls) else _SCENE_IMAGE_URLS_DEFAULT[i])
-            if not _download_scene_image(url, str(path), scene_index=i):
-                # 按镜索引选用不同 fallback，避免 6 张图都用同一张；再轮询其余 URL
-                fallback_list = _SCENE_IMAGE_URLS_FALLBACK
-                nf = len(fallback_list)
-                for k in range(nf):
-                    fallback_url = fallback_list[(i + k) % nf]
-                    if _download_scene_image(fallback_url, str(path), scene_index=i):
-                        break
-                else:
-                    # 备用 URL 均失败时，从本地图库取图（20 张日常生活/城市/山川，需先运行 scripts/download_scene_library.py）
-                    lib_path = _get_library_scene_path(i)
-                    if lib_path and lib_path.exists():
-                        img = _load_and_style_background_image(str(lib_path), width, height, style=style)
-                        if img is not None:
-                            return img
-                    return None
+            # 优先：若配置了 Pixabay，则按主题+场景描述抓取一张背景图
+            if _fetch_scene_image_from_pixabay(theme, scene_description, i, width, height, str(path)):
+                got = True
+            if not got:
+                if use_jimeng and JIYMENG_ENABLED:
+                    logger.info("即梦未生成第 %d 镜背景，使用 URL 图库备用", i)
+                urls = _get_scene_urls_for_style(style, theme=theme)
+                url = _get_scene_url_by_description(scene_description, i) if scene_description else None
+                if not url:
+                    # 不同主题/场景描述使用不同起点，避免所有主题都落在同一组背景图上
+                    theme_key = (theme or "").strip() or (scene_description or "").strip() or "default"
+                    base_hash = abs(hash(theme_key)) if theme_key else 0
+                    if urls:
+                        idx = (base_hash + i) % len(urls)
+                        url = os.getenv(f"SCENE_IMAGE_URL_{i}", urls[idx])
+                    else:
+                        url = os.getenv(f"SCENE_IMAGE_URL_{i}", _SCENE_IMAGE_URLS_DEFAULT[i])
+                if not _download_scene_image(url, str(path), scene_index=i):
+                    # 按主题 hash + 镜索引选用不同 fallback，避免 6 张图都用同一张；再轮询其余 URL
+                    fallback_list = _SCENE_IMAGE_URLS_FALLBACK
+                    nf = len(fallback_list)
+                    theme_key = (theme or "").strip() or (scene_description or "").strip() or "default"
+                    base_hash = abs(hash(theme_key)) if theme_key else 0
+                    for k in range(nf):
+                        j = (base_hash + i + k) % nf
+                        fallback_url = fallback_list[j]
+                        if _download_scene_image(fallback_url, str(path), scene_index=i):
+                            break
+                    else:
+                        # 备用 URL 均失败时，从本地图库取图（20 张日常生活/城市/山川，需先运行 scripts/download_scene_library.py）
+                        lib_path = _get_library_scene_path(i)
+                        if lib_path and lib_path.exists():
+                            img = _load_and_style_background_image(str(lib_path), width, height, style=style)
+                            if img is not None:
+                                return img
+                        return None
     try:
         from PIL import ImageFilter
         img = Image.open(str(path)).convert("RGB")
@@ -1556,15 +1648,17 @@ def _fetch_and_save_story_backgrounds(
     height: int,
     save_dir: str,
     no_blur: bool = False,
+    prefer_jimeng: Optional[bool] = None,
 ) -> list:
     """
     按故事情节描述抓取并保存 6 张对应场景背景图到 save_dir（scene_0_bg.jpg ... scene_5_bg.jpg）。
-    首选即梦文生图（与故事一致），失败则用 URL 图库备用。
+    首选即梦文生图（与故事一致），失败则用 URL 图库备用。prefer_jimeng 为 None 时用环境变量。
     no_blur=True 时不虚化（自定义旁白模式）。
     """
     if not scene_descriptions or len(scene_descriptions) < 6:
         return []
-    if PREFER_JIMENG_SCENE and JIYMENG_ENABLED:
+    use_jimeng = prefer_jimeng if prefer_jimeng is not None else PREFER_JIMENG_SCENE
+    if use_jimeng and JIYMENG_ENABLED:
         logger.info("6 镜背景：按配置走即梦文生图（与故事情节一致），失败则按描述关键词选图库备用")
     else:
         logger.info("6 镜背景：即梦未配置或已关闭，按场景描述关键词选图库")
@@ -1575,7 +1669,7 @@ def _fetch_and_save_story_backgrounds(
     for i in range(6):
         desc = (scene_descriptions[i] if i < len(scene_descriptions) else "").strip() or None
         img = _get_scene_background_image(
-            i, width, height, style=style, theme=theme, scene_description=desc, apply_blur=not no_blur
+            i, width, height, style=style, theme=theme, scene_description=desc, apply_blur=not no_blur, prefer_jimeng=prefer_jimeng
         )
         if img is None:
             logger.warning("故事情节背景图第 %d 镜获取失败，回退将使用默认流程", i)
@@ -2279,10 +2373,12 @@ def _generate_video_mvp(
     reuse_scene_urls: Optional[list] = None,
     custom_scene_image_paths: Optional[list] = None,
     regenerate_scene_index_with_jimeng: Optional[int] = None,
+    prefer_jimeng_scene: Optional[bool] = None,
 ) -> tuple:
     """
     MVP: 背景图 + 字幕 + TTS 配音；视频时长 = 配音时长，声画同步。
     若提供 scene_descriptions（6 个故事情节对应的场景描述），则每镜背景图按该描述生成/选取，故事与画面一致。
+    prefer_jimeng_scene：True=即梦优先，False=URL 图库，None=用环境变量。
     若提供 reuse_scene_urls（6 个场景图 URL），则直接从本地库加载，不再生成新图（用于「再用一次」）。
     若提供 custom_scene_image_paths（6 个元素，可为 None 或路径），则对应下标使用该图替换当镜背景，实现「单独更换第 N 镜」。
     若提供 regenerate_scene_index_with_jimeng（0~5），则仅用即梦 AI 重绘该镜背景，其余镜不变（常用于「再用一次」时只重绘第 2 镜等）。
@@ -2342,7 +2438,7 @@ def _generate_video_mvp(
             scene_bg_paths = []
             if scene_descriptions and len(scene_descriptions) >= 6:
                 scene_bg_paths = _fetch_and_save_story_backgrounds(
-                    scene_descriptions, style, theme, w, h, scene_dir, no_blur=True
+                    scene_descriptions, style, theme, w, h, scene_dir, no_blur=True, prefer_jimeng=prefer_jimeng_scene
                 )
             if len(scene_bg_paths) == 6 and not has_user_image:
                 # 无用户上传图：六镜直接用背景图，不虚化（自定义旁白模式）

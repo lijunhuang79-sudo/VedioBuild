@@ -165,6 +165,8 @@ export const tasksApi = {
       scene_images?: (File | null)[];
       /** 仅用即梦重绘第 N 镜（1~6），不传则不重绘 */
       regenerate_scene_index_with_jimeng?: string;
+      /** 六镜背景图生成方式：'1'=即梦优先，'0'=URL 图库，不传=跟随环境 */
+      prefer_jimeng_scene?: string;
     }
   ) => {
     const form = new FormData();
@@ -186,6 +188,9 @@ export const tasksApi = {
     }
     if (options?.regenerate_scene_index_with_jimeng && /^[1-6]$/.test(options.regenerate_scene_index_with_jimeng)) {
       form.append('regenerate_scene_index_with_jimeng', options.regenerate_scene_index_with_jimeng);
+    }
+    if (options?.prefer_jimeng_scene === '1' || options?.prefer_jimeng_scene === '0') {
+      form.append('prefer_jimeng_scene', options.prefer_jimeng_scene);
     }
     return api<Task>('/api/tasks', {
       method: 'POST',

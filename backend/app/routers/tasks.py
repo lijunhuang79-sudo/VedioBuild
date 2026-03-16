@@ -71,10 +71,11 @@ def create_task(
     scene_image_4: Optional[UploadFile] = File(None),
     scene_image_5: Optional[UploadFile] = File(None),
     regenerate_scene_index_with_jimeng: Optional[str] = Form(None),
+    prefer_jimeng_scene: Optional[str] = Form(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """创建视频生成任务。可选 script_text + scene_descriptions（6 条）；reuse_from_task_id 时复用该任务的 6 张场景图；scene_image_N 可单独替换第 N+1 镜背景图；regenerate_scene_index_with_jimeng=1..6 时仅用即梦重绘第 N 镜背景。"""
+    """创建视频生成任务。可选 script_text + scene_descriptions（6 条）；reuse_from_task_id 时复用该任务的 6 张场景图；scene_image_N 可单独替换第 N+1 镜背景图；regenerate_scene_index_with_jimeng=1..6 时仅用即梦重绘第 N 镜；prefer_jimeng_scene=1/0 指定六镜背景用即梦或 URL 图库。"""
     if current_user.credits <= 0:
         raise HTTPException(status_code=402, detail="额度不足，请先购买套餐")
 
@@ -147,6 +148,12 @@ def create_task(
 
         current_user.credits -= 1
         db.commit()
+        # 简单限流：本地仅保留当前用户最近 10 条有视频文件的任务，其余旧任务与文件自动清理
+        try:
+            _prune_old_videos_for_user(db, current_user.id, keep=10)
+        except Exception:
+            # 清理失败不影响主流程
+            pass
 
         # 自定义旁白：单独替换某镜背景图（scene_image_0..5 对应第 1..6 镜）
         custom_scene_image_paths = None
@@ -205,7 +212,15 @@ def create_task(
                         jimeng_scene_index = n - 1
                 except ValueError:
                     pass
-            logger.info("create_task: image_url=%s image_path=%s", image_url or "(无)", image_path or "(无)")
+            # 六镜背景图生成方式：1/true=即梦优先，0/false=URL 图库，未传=用环境变量
+            prefer_jimeng = None
+            if prefer_jimeng_scene is not None and str(prefer_jimeng_scene).strip():
+                v = str(prefer_jimeng_scene).strip().lower()
+                if v in ("1", "true", "yes"):
+                    prefer_jimeng = True
+                elif v in ("0", "false", "no"):
+                    prefer_jimeng = False
+            logger.info("create_task: image_url=%s image_path=%s prefer_jimeng_scene=%s", image_url or "(无)", image_path or "(无)", prefer_jimeng)
             def run_inline():
                 import sys
                 root = Path(__file__).resolve().parent.parent.parent.parent
@@ -226,6 +241,7 @@ def create_task(
                     reuse_scene_urls=reuse_scene_urls,
                     custom_scene_image_paths=custom_scene_image_paths,
                     regenerate_scene_index_with_jimeng=jimeng_scene_index,
+                    prefer_jimeng_scene=prefer_jimeng,
                 )
             threading.Thread(target=run_inline, daemon=True).start()
         else:
@@ -237,6 +253,13 @@ def create_task(
                         jimeng_scene_index = n - 1
                 except ValueError:
                     pass
+            prefer_jimeng = None
+            if prefer_jimeng_scene is not None and str(prefer_jimeng_scene).strip():
+                v = str(prefer_jimeng_scene).strip().lower()
+                if v in ("1", "true", "yes"):
+                    prefer_jimeng = True
+                elif v in ("0", "false", "no"):
+                    prefer_jimeng = False
             celery_app.send_task(
                 "worker.tasks.generate_video_task",
                 kwargs={
@@ -253,6 +276,7 @@ def create_task(
                     "reuse_scene_urls": reuse_scene_urls,
                     "custom_scene_image_paths": None,
                     "regenerate_scene_index_with_jimeng": jimeng_scene_index,
+                    "prefer_jimeng_scene": prefer_jimeng,
                 },
             )
 
@@ -290,6 +314,36 @@ def _get_task_video_path(task: VideoTask) -> Optional[str]:
     static_videos = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "static", "videos"))
     path = os.path.join(static_videos, fname)
     return path if os.path.isfile(path) else None
+
+
+def _prune_old_videos_for_user(db: Session, user_id: int, keep: int = 10) -> None:
+    """
+    保留当前用户最新 keep 个本地视频任务，其余已完成的旧任务自动删除本地文件并移除记录。
+    仅针对有本地视频文件的 COMPLETED 任务。
+    """
+    try:
+        q = (
+            db.query(VideoTask)
+            .filter(VideoTask.user_id == user_id, VideoTask.status == TaskStatus.COMPLETED.value)
+            .order_by(VideoTask.created_at.desc())
+        )
+        tasks = q.all()
+        if len(tasks) <= keep:
+            return
+        to_delete = tasks[keep:]
+        for t in to_delete:
+            path = _get_task_video_path(t)
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError as e:
+                    logger.warning("prune_videos: 删除本地视频文件失败 path=%s err=%s", path, e)
+            db.delete(t)
+        db.commit()
+        if to_delete:
+            logger.info("prune_videos: 为 user=%s 删除旧视频任务 %d 条，仅保留最新 %d 条", user_id, len(to_delete), keep)
+    except Exception as e:
+        logger.warning("prune_videos: 自动清理旧视频任务出错: %s", e)
 
 
 def _serve_task_video(task: VideoTask):

@@ -34,6 +34,7 @@ def run_story_ad_skill(
     reuse_scene_urls: Optional[list] = None,
     custom_scene_image_paths: Optional[list] = None,
     regenerate_scene_index_with_jimeng: Optional[int] = None,
+    prefer_jimeng_scene: Optional[bool] = None,
 ) -> tuple:
     """
     执行「故事化广告」全流程：生成故事文案与 6 镜场景描述 → 抓取并保存 6 张对应背景图 → 生成视频并嵌入每镜背景。
@@ -81,5 +82,6 @@ def run_story_ad_skill(
         reuse_scene_urls=reuse_scene_urls,
         custom_scene_image_paths=custom_scene_image_paths,
         regenerate_scene_index_with_jimeng=regenerate_scene_index_with_jimeng,
+        prefer_jimeng_scene=prefer_jimeng_scene,
     )
     return (out_path, scene_urls)

@@ -29,6 +29,8 @@ export default function DashboardPage() {
   const [sceneImages, setSceneImages] = useState<(File | null)[]>(() => Array(6).fill(null));
   /** 仅用即梦 AI 重绘第 N 镜背景（1~6），空为不重绘；常用于「再用一次」时只重绘场景二等 */
   const [regenerateSceneIndexWithJimeng, setRegenerateSceneIndexWithJimeng] = useState<string>('');
+  /** 六镜背景图生成方式：''=默认(环境)，'1'=即梦优先，'0'=URL 图库 */
+  const [preferJimengScene, setPreferJimengScene] = useState<string>('');
 
   const fetchUser = async () => {
     try {
@@ -100,13 +102,14 @@ export default function DashboardPage() {
     setError('');
     setSubmitting(true);
     try {
-      const options: { script_text?: string; scene_descriptions?: string[]; reuse_from_task_id?: string; scene_images?: (File | null)[]; regenerate_scene_index_with_jimeng?: string } =
+      const options: { script_text?: string; scene_descriptions?: string[]; reuse_from_task_id?: string; scene_images?: (File | null)[]; regenerate_scene_index_with_jimeng?: string; prefer_jimeng_scene?: string } =
         createMode === 'custom' && scriptText.trim() && sceneDescriptions.every((s) => (s || '').trim())
           ? { script_text: scriptText.trim(), scene_descriptions: sceneDescriptions.map((s) => (s || '').trim()) }
           : {};
       if (reuseFromTaskId) options.reuse_from_task_id = reuseFromTaskId;
       if (createMode === 'custom' && sceneImages.some((f) => f != null)) options.scene_images = sceneImages;
       if (regenerateSceneIndexWithJimeng && /^[1-6]$/.test(regenerateSceneIndexWithJimeng)) options.regenerate_scene_index_with_jimeng = regenerateSceneIndexWithJimeng;
+      if (preferJimengScene === '1' || preferJimengScene === '0') options.prefer_jimeng_scene = preferJimengScene;
       const created = await tasksApi.create(
         theme,
         'default',
@@ -317,6 +320,23 @@ export default function DashboardPage() {
                 </select>
                 <p className="text-slate-500 text-xs mt-1">
                   选「好莱坞大片」得 12 秒+、居中大标题 + 更长转场 + 强镜头推进；选「科技」得科技感画面。
+                </p>
+              </div>
+              <div>
+                <label className="block text-sm text-slate-400 mb-2">
+                  六镜背景图生成方式
+                </label>
+                <select
+                  value={preferJimengScene}
+                  onChange={(e) => setPreferJimengScene(e.target.value)}
+                  className="w-full px-4 py-3 rounded-lg bg-slate-800 border border-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-500 text-white"
+                >
+                  <option value="">默认（跟随环境配置）</option>
+                  <option value="1">即梦 AI（与故事情节一致，需配置即梦 API）</option>
+                  <option value="0">URL 图库（即梦不可用时的备用图库）</option>
+                </select>
+                <p className="text-slate-500 text-xs mt-1">
+                  选「即梦 AI」时六镜背景按场景描述由即梦文生图生成；选「URL 图库」则从图库选图，不调用即梦。
                 </p>
               </div>
               <div>

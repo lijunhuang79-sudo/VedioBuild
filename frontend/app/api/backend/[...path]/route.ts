@@ -55,18 +55,18 @@ async function proxy(
     if (k !== 'host' && k !== 'connection') headers.set(key, value);
   });
 
-  let body: string | undefined;
-  try {
-    body = await request.text();
-  } catch {
-    body = undefined;
-  }
-
-  const res = await fetch(targetUrl, {
+  // 直接透传原始 body 流，避免对 multipart/form-data / 二进制做 text() 破坏上传（尤其是带图片的表单）
+  const init: RequestInit = {
     method,
     headers,
-    body: body || undefined,
-  });
+  };
+  if (method !== 'GET' && method !== 'HEAD') {
+    (init as any).body = request.body;
+    // Node.js (undici) 透传流式 body 需要 duplex: 'half'
+    (init as any).duplex = 'half';
+  }
+
+  const res = await fetch(targetUrl, init);
 
   const resHeaders = new Headers();
   res.headers.forEach((value, key) => {
